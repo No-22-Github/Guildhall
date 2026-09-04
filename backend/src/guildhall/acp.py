@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from typing import Any, AsyncIterator, Callable, Optional
@@ -72,6 +73,7 @@ class AcpSession:
         self._posted_once = False
         self._seen_response_ids: set[str] = set()
         self.turn_text: list[str] = []  # 本轮 agent_message_chunk 文本,按序拼接
+        self._active_prompts = 0
 
     # ---------- 生命周期 ----------
 
@@ -110,69 +112,121 @@ class AcpSession:
         if not self._agent_session_id:
             raise RuntimeError("session not created; call new_session() first")
         self.turn_text = []
+        self._active_prompts += 1
         rid = self._next_id
         self._next_id += 1
         env = {"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
                "params": {"sessionId": self._agent_session_id, "prompt": [{"type": "text", "text": text}]}}
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
+        post_task: Optional[asyncio.Task[httpx.Response]] = asyncio.create_task(
+            self._client.post(
+                self.url,
+                json=env,
+                headers={"Accept": "application/json"},
+                timeout=httpx.Timeout(3600.0, connect=10.0),
+            ),
+            name=f"prompt-post:{self.session_name}:{rid}",
+        )
+
+        async def stop_post() -> None:
+            nonlocal post_task
+            if post_task is None:
+                return
+            if not post_task.done():
+                post_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await post_task
+            post_task = None
+
         try:
-            # POST 也可能被上游挂死:总超时覆盖 POST 与等待全程
-            resp = await asyncio.wait_for(
-                self._client.post(
-                    self.url,
-                    json=env,
-                    headers={"Accept": "application/json"},
-                    timeout=httpx.Timeout(3600.0, connect=10.0),
-                ),
-                timeout=timeout,
-            )
-            if resp.status_code in (202, 204):
-                pass
-            elif resp.status_code == 200:
-                body = resp.text.strip()
-                if body and body != "null":
-                    self._maybe_resolve(json.loads(body))
-            else:
-                raise AcpError(-32000, f"session/prompt HTTP {resp.status_code}: {resp.text[:200]}")
-            # 轮末响应在真实环境里偶发丢失。单发轮次(干完活必须收尾的角色)用
-            # 流空闲兜底:静默超过 idle_timeout 且已有文本产出,视为轮已结束。
+            # 真实 sandbox-agent 可能把 POST 保持到整轮结束，同时把 token 从 SSE
+            # 发出来。POST 必须与 future/空闲看门狗并行等待，否则 POST 自己挂住时
+            # idle_timeout 永远没有机会执行。
             deadline = asyncio.get_running_loop().time() + timeout
             result = None
             while result is None:
-                try:
-                    result = await asyncio.wait_for(asyncio.shield(fut), timeout=2.0)
-                except asyncio.TimeoutError:
-                    now = asyncio.get_running_loop().time()
-                    if now > deadline:
-                        self._pending.pop(rid, None)
-                        try:
-                            await self.cancel()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        raise AcpError(-32000, f"turn 超过 {timeout:.0f}s 无响应,已发 cancel")
-                    if (
-                        idle_timeout is not None
-                        and self.turn_text
-                        and now - self._last_event_at > idle_timeout
-                    ):
+                waiters: set[asyncio.Future] = {fut}
+                if post_task is not None:
+                    waiters.add(post_task)
+                done, _ = await asyncio.wait(waiters, timeout=2.0, return_when=asyncio.FIRST_COMPLETED)
+
+                if post_task is not None and post_task in done:
+                    resp = post_task.result()
+                    post_task = None
+                    if resp.status_code in (202, 204):
+                        pass
+                    elif resp.status_code == 200:
+                        body = resp.text.strip()
+                        if body and body != "null":
+                            self._maybe_resolve(json.loads(body))
+                    elif self._is_clean_agent_exit(resp):
                         log.warning(
-                            "sse %s: 流空闲 %.0fs 且已有产出,按轮结束处理(响应可能已丢失)",
-                            self.session_name, now - self._last_event_at,
+                            "session %s: agent 进程 exit 0 且已有正文，按轮结束处理",
+                            self.session_name,
                         )
                         self._pending.pop(rid, None)
-                        return "end_turn(assumed)"
-                    continue
-        except asyncio.TimeoutError:
-            self._pending.pop(rid, None)
-            try:
-                await self.cancel()
-            except Exception:  # noqa: BLE001
-                pass
-            raise AcpError(-32000, f"turn 超过 {timeout:.0f}s 无响应,已发 cancel")
+                        return "end_turn(agent_exit_0)"
+                    else:
+                        raise AcpError(-32000, f"session/prompt HTTP {resp.status_code}: {resp.text[:200]}")
+
+                if fut.done():
+                    result = fut.result()
+                    break
+
+                now = asyncio.get_running_loop().time()
+                if now > deadline:
+                    self._pending.pop(rid, None)
+                    await stop_post()
+                    with contextlib.suppress(Exception):
+                        await self.cancel()
+                    raise AcpError(-32000, f"turn 超过 {timeout:.0f}s 无响应,已发 cancel")
+                if idle_timeout is not None and self.turn_text and now - self._last_event_at > idle_timeout:
+                    log.warning(
+                        "sse %s: 流空闲 %.0fs 且已有产出,按轮结束处理(响应可能已丢失)",
+                        self.session_name, now - self._last_event_at,
+                    )
+                    self._pending.pop(rid, None)
+                    await stop_post()
+                    with contextlib.suppress(Exception):
+                        await self.cancel()
+                    return "end_turn(assumed)"
         finally:
+            await stop_post()
             self._pending.pop(rid, None)
+            self._active_prompts = max(0, self._active_prompts - 1)
         return result.get("stopReason", "end_turn")
+
+    def _is_clean_agent_exit(self, response: httpx.Response) -> bool:
+        """sandbox-agent 会把 Claude 正常 exit 0 包成 500；已有正文时等价于轮次完成。"""
+        if response.status_code != 500 or not self.turn_text:
+            return False
+        try:
+            body = response.json()
+        except (json.JSONDecodeError, ValueError):
+            return False
+        return (
+            str(body.get("type", "")).endswith(":agent_process_exited")
+            and ((body.get("details") or {}).get("exitCode") == 0)
+        )
+
+    async def steer(self, text: str) -> str:
+        """把补充消息注入正在运行的 Claude turn。
+
+        claude-agent-acp 通过 `_session/steering` 暴露 Claude Code 的原生插话能力。
+        空闲时要求调用方改走普通 prompt，避免 adapter 偷偷启动一个无法追踪生命周期的 turn。
+        """
+        if not self._agent_session_id:
+            raise RuntimeError("session not created; call new_session() first")
+        result = await self._request(
+            "_session/steering",
+            {
+                "sessionId": self._agent_session_id,
+                "prompt": [{"type": "text", "text": text}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            },
+        )
+        return str((result or {}).get("outcome") or "promptRequired")
 
     async def cancel(self) -> None:
         if self._agent_session_id:
@@ -377,3 +431,11 @@ class AcpSession:
     def offset(self) -> int:
         """当前上游 SSE 游标(state.json offsets 的来源)。"""
         return self._last_event_id
+
+    @property
+    def is_prompting(self) -> bool:
+        return self._active_prompts > 0
+
+    @property
+    def seconds_since_event(self) -> float:
+        return max(0.0, asyncio.get_running_loop().time() - self._last_event_at)

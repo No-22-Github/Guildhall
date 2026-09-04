@@ -97,6 +97,25 @@ def receptionist_system_prompt(store: QuestStore) -> str:
     return RECEPTIONIST_SYSTEM.format(lore=lore, template=quest_template(store))
 
 
+def receptionist_first_message(store: QuestStore, opening_message: str | None) -> str:
+    """ACP 没有独立 system 消息槽，首轮必须把角色契约和用户原话一起交给模型。
+
+    旧实现先单独发送角色契约并等待 Claude 回完整一轮，导致它只凭 quest slug
+    开始调研；用户真正的问题直到第二轮才到。这里把两者合成同一首轮，同时保留
+    用户原话为清晰、不可与模板混淆的边界。
+    """
+    system = receptionist_system_prompt(store)
+    if not opening_message:
+        return system
+    return (
+        system
+        + "\n\n<user-request>\n"
+        + opening_message.strip()
+        + "\n</user-request>\n\n"
+        + "现在直接处理 <user-request> 中的需求：先调研能从项目中确认的事实，再提出本轮需要用户回答的问题。"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # §2.6.2 Adventurer —— 冒险者(实现),首条消息逐字
 # ─────────────────────────────────────────────────────────────────────────────

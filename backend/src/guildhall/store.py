@@ -135,6 +135,26 @@ class QuestStore:
             _atomic_write(self.state_json, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
             return state
 
+    def retry_failed(self, expected_phase: str) -> dict[str, Any]:
+        """受控恢复基础设施失败；普通状态机仍不开放 failed 的任意出口。"""
+        with self._lock:
+            state = self.read_state()
+            if state.get("state") != sm.FAILED:
+                raise RuntimeError("只有 failed 状态能重试")
+            failure = state.get("history", [])[-1] if state.get("history") else {}
+            if failure.get("to") != sm.FAILED or failure.get("from") != expected_phase:
+                raise RuntimeError(f"failed 不是从 {expected_phase} 阶段进入，不能用此恢复入口")
+            state["state"] = expected_phase
+            state["error"] = None
+            state["history"].append({
+                "at": now_iso(),
+                "from": sm.FAILED,
+                "to": expected_phase,
+                "recovery": "retry",
+            })
+            _atomic_write(self.state_json, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+            return state
+
     def write_quest_md(self, text: str) -> None:
         _atomic_write(self.quest_md, text if text.endswith("\n") else text + "\n")
 

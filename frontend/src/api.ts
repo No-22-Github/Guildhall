@@ -42,6 +42,19 @@ export interface QuestDetail {
   quest_md: string | null
   state: StateJson
   appraisal: Appraisal | null
+  runtime: Record<string, AgentRuntimeStatus>
+}
+
+export interface AgentRuntimeStatus {
+  connected: boolean
+  busy: boolean
+  activity: 'starting' | 'thinking' | 'responding' | 'tool' | 'steering' | 'waiting' | 'error'
+  detail: string | null
+  active_tool: { id?: string; name: string; title?: string; status?: string } | null
+  seconds_since_event: number
+  context_used: number | null
+  context_size: number | null
+  error: string | null
 }
 
 export interface QuestSummary {
@@ -100,7 +113,11 @@ export const api = {
       body: JSON.stringify({ text }),
     }),
   generate: (id: string) =>
-    req<{ ok: boolean; quest_md?: string; reason?: string }>(`/api/quests/${id}/generate`, { method: 'POST' }),
+    req<{ ok: boolean; started?: boolean; recovered?: boolean; quest_md?: string; reason?: string }>(`/api/quests/${id}/generate`, { method: 'POST' }),
+  retryAdventurer: (id: string) =>
+    req<{ ok: boolean; state: string }>(`/api/quests/${id}/retry-adventurer`, { method: 'POST' }),
+  resumeAppraisal: (id: string) =>
+    req<{ ok: boolean; state: string }>(`/api/quests/${id}/resume-appraisal`, { method: 'POST' }),
   transition: (id: string, to: string) =>
     req<{ state: string }>(`/api/quests/${id}/transition`, {
       method: 'POST',

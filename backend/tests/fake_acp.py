@@ -38,6 +38,7 @@ class FakeConn:
         self.next_event_id = 0
         self.closed = False
         self._pending: dict[int, dict[str, Any]] = {}  # request id -> envelope(延迟应答)
+        self.active_prompts = 0
 
     def push(self, env: dict[str, Any]) -> int:
         self.next_event_id += 1
@@ -62,6 +63,9 @@ class FakeAcpServer:
         self.scripts: dict[str, Script] = {}
         self.on_prompt: Optional[Callable[[str, str], None]] = None  # 旁路钩子(测试用来污染 worktree)
         self.respond_via_post_body = False  # True 时 prompt 响应走 POST body,不走 SSE
+        self.drop_prompt_response = False  # 模拟 adapter 吐完文本却丢失 stopReason
+        self.hold_prompt_response = False  # 模拟 POST 本身保持连接，只有 SSE 在持续出事件
+        self.agent_exit_code: Optional[int] = None  # 模拟 sandbox-agent 把 CLI 退出包装成 HTTP 500
         self.app = FastAPI()
         self._wire()
         self.port = _free_port()
@@ -135,26 +139,59 @@ class FakeAcpServer:
                 self.prompts.append((sid, text))
                 if self.on_prompt:
                     self.on_prompt(sid, text)
-                updates, final_text, stop = await self._run_script(sid, text)
-                for u in updates:
-                    conn.push({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fake", "update": u}})
-                resp_env = {"id": rid, "jsonrpc": "2.0", "result": {"stopReason": stop}}
-                if final_text:
-                    # 最终 agent 文本按块发出,模拟流式
-                    for i in range(0, len(final_text), 7):
+                conn.active_prompts += 1
+                try:
+                    updates, final_text, stop = await self._run_script(sid, text)
+                    for u in updates:
+                        conn.push({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fake", "update": u}})
+                    resp_env = {"id": rid, "jsonrpc": "2.0", "result": {"stopReason": stop}}
+                    if final_text:
+                        # 最终 agent 文本按块发出,模拟流式
+                        for i in range(0, len(final_text), 7):
+                            conn.push({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {"sessionId": "fake", "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": final_text[i : i + 7]},
+                                    "messageId": "fake-msg",
+                                }},
+                            })
+                    if self.respond_via_post_body:
+                        return JSONResponse(resp_env)
+                    if self.agent_exit_code is not None:
                         conn.push({
                             "jsonrpc": "2.0",
-                            "method": "session/update",
-                            "params": {"sessionId": "fake", "update": {
-                                "sessionUpdate": "agent_message_chunk",
-                                "content": {"type": "text", "text": final_text[i : i + 7]},
-                                "messageId": "fake-msg",
-                            }},
+                            "method": "_adapter/agent_exited",
+                            "params": {"agent": "claude", "exitCode": self.agent_exit_code},
                         })
-                if self.respond_via_post_body:
-                    return JSONResponse(resp_env)
-                conn.push(resp_env)
-                return Response(status_code=202)
+                        return JSONResponse(
+                            status_code=500,
+                            content={
+                                "type": "urn:sandbox-agent:error:agent_process_exited",
+                                "title": "Agent Process Exited",
+                                "status": 500,
+                                "detail": "agent process exited: claude",
+                                "agent": "claude",
+                                "details": {"exitCode": self.agent_exit_code, "stderr": ""},
+                            },
+                        )
+                    if self.hold_prompt_response:
+                        while not await request.is_disconnected():
+                            await asyncio.sleep(0.02)
+                        return Response(status_code=499)
+                    if self.drop_prompt_response:
+                        return Response(status_code=202)
+                    conn.push(resp_env)
+                    return Response(status_code=202)
+                finally:
+                    conn.active_prompts = max(0, conn.active_prompts - 1)
+            if method == "_session/steering":
+                text = "".join(b.get("text", "") for b in env["params"].get("prompt", []) if isinstance(b, dict))
+                if conn.active_prompts:
+                    self.prompts.append((sid, text))
+                    return JSONResponse({"id": rid, "jsonrpc": "2.0", "result": {"outcome": "injected"}})
+                return JSONResponse({"id": rid, "jsonrpc": "2.0", "result": {"outcome": "promptRequired"}})
             if method == "authenticate":
                 return JSONResponse({"id": rid, "jsonrpc": "2.0", "result": {}})
             if rid is not None:  # 其他请求:回空结果

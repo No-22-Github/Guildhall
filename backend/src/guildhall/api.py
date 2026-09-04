@@ -144,10 +144,12 @@ def build_app(context: AppContext) -> FastAPI:
     @app.get("/api/quests/{quest_id}")
     async def get_quest(quest_id: str) -> dict[str, Any]:
         store = _store(quest_id)
+        runtime = get_ctx().runtimes.get(quest_id)
         return {
             "quest_md": store.read_quest_md(),
             "state": store.read_state(),
             "appraisal": store.read_appraisal(),
+            "runtime": runtime.status() if runtime is not None else {},
         }
 
     @app.put("/api/quests/{quest_id}/quest")
@@ -167,6 +169,16 @@ def build_app(context: AppContext) -> FastAPI:
         if state["state"] != sm.DRAFTING:
             raise HTTPException(409, f"只有 drafting 状态能对话(当前 {state['state']})")
         rt = get_ctx().runtime(store)
+        if flow.is_generation_request(body.text):
+            result = flow.request_generate_quest(
+                rt,
+                prompt_override=body.text,
+                visible_user_text=body.text,
+                force_regenerate=True,
+            )
+            if not result.get("ok"):
+                raise HTTPException(409, result.get("reason") or "无法开始生成需求单")
+            return result
         receiver = rt.get_role("receptionist")
         if receiver is None:
             # 服务重启后 runtime 丢失:重建 session(从 offsets 续),再投喂
@@ -185,14 +197,8 @@ def build_app(context: AppContext) -> FastAPI:
         (§3 表格外的辅助路由:否则服务端无法从聊天流里可靠截出 quest.md。)
         """
         store = _store(quest_id)
-        existing = store.read_quest_md()
-        if existing is not None:
-            # 幂等:quest.md 已在盘上(可能上次已生成、或人工救回),直接返回,不打模型
-            return {"ok": True, "quest_md": existing}
         rt = get_ctx().runtime(store)
-        if rt.get_role("receptionist") is None:
-            await flow.start_receptionist(rt, None)
-        return await flow.generate_quest(rt)
+        return flow.request_generate_quest(rt)
 
     @app.get("/api/quests/{quest_id}/events/{role}")
     async def events(quest_id: str, role: str, request: Request, offset: int = -1) -> StreamingResponse:
@@ -289,6 +295,64 @@ def build_app(context: AppContext) -> FastAPI:
         rt = get_ctx().runtime(store)
         asyncio.create_task(_named_appraise(rt, quest_id))
         return {"ok": True}
+
+    @app.post("/api/quests/{quest_id}/retry-adventurer")
+    async def retry_adventurer(quest_id: str) -> dict[str, Any]:
+        """恢复因后端/sandbox-agent 断开而失败的冒险者，复用原 worktree。"""
+        store = _store(quest_id)
+        state = store.read_state()
+        if state.get("state") != sm.FAILED:
+            raise HTTPException(409, "只有 failed 状态能重试冒险者")
+        failure = state.get("history", [])[-1] if state.get("history") else {}
+        if failure.get("from") != sm.IN_PROGRESS:
+            raise HTTPException(409, "该失败不是发生在冒险者阶段，不能从这里重试")
+        busy = st.any_in_progress()
+        if busy and busy != quest_id:
+            raise HTTPException(409, f"同一时刻只允许一个 quest 处于 in_progress(当前:{busy})")
+        try:
+            new_state = store.retry_failed(sm.IN_PROGRESS)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        rt = get_ctx().runtime(store)
+        asyncio.create_task(flow.dispatch_adventurer(rt, get_ctx().manager, reuse_worktree=True))
+        return {"ok": True, "state": new_state["state"]}
+
+    @app.post("/api/quests/{quest_id}/resume-appraisal")
+    async def resume_appraisal(quest_id: str) -> dict[str, Any]:
+        """冒险者已产出并正常退出但被误判失败时，跳过重复执行，直接开始验收。"""
+        store = _store(quest_id)
+        state = store.read_state()
+        if state.get("state") != sm.FAILED:
+            raise HTTPException(409, "只有 failed 状态能恢复到验收")
+        failure = state.get("history", [])[-1] if state.get("history") else {}
+        if failure.get("from") != sm.IN_PROGRESS:
+            raise HTTPException(409, "该失败不是发生在冒险者阶段，不能直接开始验收")
+        if not state.get("base_commit") or not layout.worktree_path(quest_id).is_dir():
+            raise HTTPException(409, "worktree 或基点不存在，不能直接开始验收")
+        events = store.read_events("adventurer")
+        has_output = any(
+            ((event.get("params") or {}).get("update") or {}).get("sessionUpdate") == "agent_message_chunk"
+            for event in events
+        )
+        clean_exit = any(
+            event.get("method") == "_adapter/agent_exited"
+            and (
+                (event.get("params") or {}).get("success") is True
+                or (event.get("params") or {}).get("exitCode") == 0
+                or (event.get("params") or {}).get("code") == 0
+            )
+            for event in events
+        )
+        if not has_output or not clean_exit:
+            raise HTTPException(409, "没有找到冒险者完整输出与正常退出证据，请使用“重试冒险者”")
+        try:
+            store.retry_failed(sm.IN_PROGRESS)
+            new_state = store.transition(sm.APPRAISING)
+        except (RuntimeError, sm.InvalidTransition) as e:
+            raise HTTPException(409, str(e))
+        rt = get_ctx().runtime(store)
+        asyncio.create_task(_named_appraise(rt, quest_id))
+        return {"ok": True, "state": new_state["state"]}
 
     @app.get("/api/quests/{quest_id}/diff")
     async def quest_diff(quest_id: str) -> dict[str, Any]:

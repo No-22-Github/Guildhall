@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, STATE_COLOR, STATE_LABEL } from '../api'
-import type { Appraisal, QuestDetail } from '../api'
+import type { AgentRuntimeStatus, Appraisal, QuestDetail } from '../api'
 import { useEventStream } from '../useEventStream'
 
 /** 冒险者/鉴定人的事件流摘要:工具调用行 + 最终文本。 */
-function RoleDigest({ questId, role }: { questId: string; role: string }) {
-  const events = useEventStream(questId, role, true)
+function RoleDigest({ questId, role, status }: { questId: string; role: string; status?: AgentRuntimeStatus }) {
+  // failed 页初次挂载时角色可能尚未恢复；connected 翻转后必须重建 SSE，
+  // 否则旧连接只重放失败前的几条事件，后续工具/文本永远进不了页面。
+  const events = useEventStream(questId, role, true, status?.connected ? 'connected' : 'offline')
   const digest = useMemo(() => {
     const tools: string[] = []
     let text = ''
@@ -18,11 +20,31 @@ function RoleDigest({ questId, role }: { questId: string; role: string }) {
     return { tools, text }
   }, [events])
 
+  const roleName = role === 'adventurer' ? '冒险者' : '鉴定人'
+  const activity = status?.active_tool
+    ? `正在运行 ${status.active_tool.name}${status.active_tool.title ? `：${status.active_tool.title}` : ''}`
+    : status?.activity === 'starting' ? '正在启动 Claude Code'
+      : status?.activity === 'thinking' ? '正在思考'
+        : status?.activity === 'responding' ? '正在回复'
+          : status?.activity === 'tool' ? '正在使用工具'
+            : status?.activity === 'error' ? '运行异常'
+              : status ? '等待中' : '尚未启动'
+  const quiet = status?.busy && status.seconds_since_event >= 15
+    ? ` · ${Math.round(status.seconds_since_event)} 秒无新事件`
+    : ''
+  const context = status?.context_size && status.context_used != null
+    ? ` · 上下文 ${Math.round((status.context_used / status.context_size) * 100)}%`
+    : ''
+
   return (
     <div className="rounded border bg-gray-50 p-2 text-xs">
-      <div className="mb-1 font-semibold">{role === 'adventurer' ? '冒险者' : '鉴定人'} 实况</div>
+      <div className="mb-1 flex items-center gap-2 font-semibold">
+        <span className={`h-2 w-2 rounded-full ${status?.activity === 'error' ? 'bg-red-500' : status?.busy ? 'animate-pulse bg-emerald-500' : 'bg-gray-300'}`} />
+        <span>{roleName} · {activity}{quiet}{context}</span>
+        <span className="ml-auto font-normal text-gray-400">事件 {events.length.toLocaleString()}</span>
+      </div>
       <div className="text-gray-500">
-        {digest.tools.length > 0 ? `工具调用:${digest.tools.slice(-8).join(' → ')}` : '(还没有动作)'}
+        {digest.tools.length > 0 ? `工具调用：${digest.tools.slice(-8).join(' → ')}` : status?.busy ? '事件流正在更新…' : '(还没有动作)'}
       </div>
       {digest.text && <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-gray-700">{digest.text}</pre>}
     </div>
@@ -42,8 +64,10 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
     if (['in_progress', 'appraising', 'appraised', 'disputed', 'settled', 'failed'].includes(d.state.state)) {
       api.getDiff(questId).then((r) => setDiff(r.diff)).catch(() => {})
     }
-    if (d.state.state !== 'appraising' || d.appraisal) {
+    if (['appraised', 'disputed', 'settled'].includes(d.state.state)) {
       api.getAppraisal(questId).then(setAppraisal).catch(() => setAppraisal(null))
+    } else {
+      setAppraisal(null)
     }
   }
 
@@ -68,6 +92,32 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
     setError('')
     try {
       await api.transition(questId, to)
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function retryAdventurer() {
+    setBusy(true)
+    setError('')
+    try {
+      await api.retryAdventurer(questId)
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function resumeAppraisal() {
+    setBusy(true)
+    setError('')
+    try {
+      await api.resumeAppraisal(questId)
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -101,6 +151,26 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
           >
             推进到验收
           </button>
+        )}
+        {state === 'failed' && detail?.state.error?.startsWith('adventurer') && (
+          <>
+            <button
+              className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+              disabled={busy}
+              title="冒险者已有完整输出并正常退出时，不重复执行，直接启动鉴定人"
+              onClick={() => void resumeAppraisal()}
+            >
+              冒险者已完成，开始验收
+            </button>
+            <button
+              className="rounded bg-amber-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+              disabled={busy}
+              title="复用现有 worktree，重新建立 Claude Code 会话并继续执行"
+              onClick={() => void retryAdventurer()}
+            >
+              重试冒险者
+            </button>
+          </>
         )}
         {state === 'appraising' && (
           <button
@@ -144,10 +214,10 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
         </div>
       )}
 
-      {(state === 'in_progress' || state === 'appraising') && (
+      {(state === 'in_progress' || state === 'appraising' || state === 'failed') && (
         <div className="grid grid-cols-2 gap-2 border-b bg-gray-50 p-2">
-          <RoleDigest questId={questId} role="adventurer" />
-          <RoleDigest questId={questId} role="appraiser" />
+          <RoleDigest questId={questId} role="adventurer" status={detail?.runtime?.adventurer} />
+          <RoleDigest questId={questId} role="appraiser" status={detail?.runtime?.appraiser} />
         </div>
       )}
 

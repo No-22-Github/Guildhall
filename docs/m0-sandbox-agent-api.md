@@ -29,6 +29,7 @@
 | `initialize` | `{protocolVersion: 1, clientInfo: {name, version}}` | `agentCapabilities` 等 |
 | `session/new` | `{cwd, mcpServers: []}` | `{sessionId, modes, configOptions}`;`configOptions` 含 `mode`(default/acceptEdits/plan/auto/bypassPermissions) |
 | `session/prompt` | `{sessionId, prompt: [{type:"text", text}]}` | `{stopReason, _meta.quota}`;**stopReason 到达即一轮结束** |
+| `_session/steering` | `{sessionId, prompt, _meta:{steering:{idleBehavior:"promptRequired"}}}` | 运行中返回 `injected`，空闲返回 `promptRequired`；claude-agent-acp 扩展 |
 | `session/cancel` | `{sessionId}`(notification) | — |
 | `session/set_mode` | `{sessionId, mode}` | — |
 
@@ -62,6 +63,9 @@
    不许把新连接的事件混写进旧 jsonl。
 3. **claude 凭据走宿主 CLI 登录态**(`credentialsAvailable: true`),
    不需要 `authenticate`。`--no-token` 只关 server 层鉴权。
+4. claude-agent-acp 0.4.2 所带 adapter 支持 `_session/steering`：运行中消息以
+   priority `now` 注入当前 turn，而不是排队成下一轮；空闲时由 Host 改走普通
+   `session/prompt`，这样每一轮仍有可追踪的开始与结束。
 
 ## 对规格书的两处勘误(实现按此,其余照旧)
 

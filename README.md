@@ -49,7 +49,7 @@ cd frontend && pnpm install && pnpm dev   # http://127.0.0.1:5173
 
 ```bash
 cd backend
-uv run pytest tests/ -q        # 37 条:状态机/磁盘布局/管线,含 M1、M5 的负向测试
+uv run pytest tests/ -q        # 49 条:状态机/磁盘布局/管线,含 M1、M5 与前台异步/插话回归
 ../scripts/e2e_check.sh        # 上面全部 + 真模型 M5 负向(手工构造偷改测试的 diff,真 appraiser 必须报 touched_tests=true)
 ```
 
@@ -70,9 +70,15 @@ M5 负向二(appraiser 弄脏 worktree → 结论整份作废)是确定性闸门
 - **事件流**:sandbox-agent 的 ACP SSE `id:` 是权威游标;guildhall 旁路写
   `events/<role>.jsonl` 并把上游游标快照进 `state.json.offsets`;
   Web 端 SSE 逐事件转发,前端拿 offset 续读,后端不做去重。
+- **前台长轮次不阻塞 HTTP**:新建后只等 ACP session 就绪就进入对话页;角色契约与
+  用户开场白合在同一首轮。运行态由 thought/message/tool/usage 事件实时推导,
+  工作中追加消息走 claude-agent-acp 的 `_session/steering` 注入当前 turn。
+- **对话可审计**:Agent 文本按 Markdown 渲染;工具前后的文本保持为独立段落;
+  Terminal/ReadFile 等工具可展开查看完整参数、命令与输出。
 - **appraisal 解析失败**:转 `disputed`、原始输出进 `error`,不重试(§6.4)。
 - **轮末信号丢失的兜底**(真实环境实测:模型后端偶发静默挂起、轮末响应丢失):
-  prompt 带总超时看门狗;单发轮次(冒险者/鉴定人)另有流空闲兜底(静默 2 分钟且已有产出即视为收尾);
+  prompt 带总超时看门狗;生成需求单有 30 秒流空闲兜底,冒险者/鉴定人有 2 分钟兜底
+  (已有产出后静默到阈值会 cancel 收口,保留已收到的结果);
   Review 页常驻「推进到验收」「重跑验收」两个恢复按钮,对应 `in_progress→appraising`
   转移与 `POST /api/quests/{id}/reappraise` 恢复入口,卡住时无需进终端。
 

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import uuid
 from typing import Any, Optional
 
 from . import store as st
@@ -34,10 +36,46 @@ class RoleRuntime:
         self.subscribers: set[asyncio.Queue] = set()
         session.on_update = self._on_envelope
         self.died: Optional[str] = None
+        self.active_turns = 0
+        self.activity = "waiting"
+        self.activity_detail: Optional[str] = None
+        self.active_tool: Optional[dict[str, Any]] = None
+        self.context_used: Optional[int] = None
+        self.context_size: Optional[int] = None
+        self.last_event_at = time.time()
 
     # ---------- 扇出 ----------
 
     def _on_envelope(self, env: dict[str, Any]) -> None:
+        self.last_event_at = time.time()
+        update = (env.get("params") or {}).get("update") or {}
+        kind = update.get("sessionUpdate")
+        if kind == "agent_thought_chunk":
+            self.activity = "thinking"
+            self.activity_detail = None
+        elif kind == "agent_message_chunk":
+            self.activity = "responding"
+            self.activity_detail = None
+        elif kind in ("tool_call", "tool_call_update"):
+            tool_name = ((update.get("_meta") or {}).get("claudeCode") or {}).get("toolName")
+            title = update.get("title")
+            status = update.get("status")
+            self.active_tool = {
+                "id": update.get("toolCallId"),
+                "name": tool_name or title or "工具",
+                "title": title,
+                "status": status or "pending",
+            }
+            if status == "completed":
+                self.activity = "thinking"
+                self.activity_detail = None
+                self.active_tool = None
+            else:
+                self.activity = "tool"
+                self.activity_detail = title or tool_name
+        elif kind == "usage_update":
+            self.context_used = update.get("used")
+            self.context_size = update.get("size")
         line = self.store.append_event(self.role, env)
         for q in list(self.subscribers):
             q.put_nowait((line, env))
@@ -66,18 +104,88 @@ class RoleRuntime:
 
     # ---------- 交互 ----------
 
-    async def send_user(self, text: str) -> None:
-        self.publish_synthetic({"method": "_guildhall/user_message", "params": {"text": text}})
-        await self.session.prompt(text)
-        self.publish_synthetic({"method": "_guildhall/turn_end", "params": {}})
-        self.flush_offset()
+    def begin_prompt(
+        self,
+        prompt_text: str,
+        *,
+        visible_user_text: Optional[str] = None,
+        kind: str = "chat",
+        idle_timeout: float | None = None,
+    ) -> asyncio.Task[str]:
+        """启动一个可观测 turn；调用方无需把 HTTP 请求挂到整轮结束。"""
+        turn_id = uuid.uuid4().hex
+        if visible_user_text:
+            self.publish_synthetic(
+                {"method": "_guildhall/user_message", "params": {"text": visible_user_text, "turnId": turn_id}}
+            )
+        self.active_turns += 1
+        self.activity = "starting"
+        self.activity_detail = None
+        self.last_event_at = time.time()
+        self.publish_synthetic(
+            {"method": "_guildhall/turn_start", "params": {"turnId": turn_id, "kind": kind}}
+        )
 
-    async def send_system(self, text: str) -> str:
-        """首条投喂(系统 prompt)。不写 user 气泡,但 turn_end 照发。"""
-        stop = await self.session.prompt(text)
-        self.publish_synthetic({"method": "_guildhall/turn_end", "params": {}})
-        self.flush_offset()
-        return stop
+        async def run() -> str:
+            stop_reason = "end_turn"
+            try:
+                stop_reason = await self.session.prompt(prompt_text, idle_timeout=idle_timeout)
+                return "".join(self.session.turn_text).strip()
+            except Exception as e:  # noqa: BLE001
+                self.died = str(e)
+                self.activity = "error"
+                self.activity_detail = str(e)
+                self.publish_synthetic(
+                    {"method": "_guildhall/turn_error", "params": {"turnId": turn_id, "kind": kind, "error": str(e)}}
+                )
+                raise
+            finally:
+                self.active_turns = max(0, self.active_turns - 1)
+                if self.active_turns == 0 and self.activity != "error":
+                    self.activity = "waiting"
+                    self.activity_detail = None
+                    self.active_tool = None
+                self.publish_synthetic(
+                    {
+                        "method": "_guildhall/turn_end",
+                        "params": {"turnId": turn_id, "kind": kind, "stopReason": stop_reason},
+                    }
+                )
+                self.flush_offset()
+
+        return asyncio.create_task(run(), name=f"{kind}:{self.store.quest_id}:{turn_id[:8]}")
+
+    async def submit_user(self, text: str) -> tuple[str, Optional[asyncio.Task[str]]]:
+        """优先插入当前 Claude turn；空闲时再启动一个普通 turn。"""
+        turn_id = uuid.uuid4().hex
+        self.publish_synthetic(
+            {"method": "_guildhall/user_message", "params": {"text": text, "turnId": turn_id}}
+        )
+        outcome = await self.session.steer(text)
+        if outcome == "promptRequired":
+            return outcome, self.begin_prompt(text, kind="chat")
+        self.activity = "steering"
+        self.activity_detail = "正在处理你的补充"
+        self.last_event_at = time.time()
+        self.publish_synthetic(
+            {"method": "_guildhall/steered", "params": {"turnId": turn_id, "outcome": outcome}}
+        )
+        return outcome, None
+
+    def status(self) -> dict[str, Any]:
+        seconds = max(0.0, time.time() - self.last_event_at)
+        busy = self.active_turns > 0 or self.session.is_prompting
+        return {
+            "connected": True,
+            "busy": busy,
+            "activity": self.activity if busy or self.activity == "error" else "waiting",
+            "detail": self.activity_detail,
+            "active_tool": self.active_tool,
+            "seconds_since_event": round(seconds, 1),
+            "context_used": self.context_used,
+            "context_size": self.context_size,
+            "error": self.died,
+        }
 
     async def close(self) -> None:
         try:
@@ -94,11 +202,12 @@ class QuestRuntime:
         self.manager = manager
         self.roles: dict[str, RoleRuntime] = {}
         self.tasks: set[asyncio.Task] = set()
+        self.generation_task: Optional[asyncio.Task] = None
         self.closing = False
 
     # ---------- 角色会话 ----------
 
-    async def open_role(self, role: str, cwd: str, first_message: str, *, system: bool = False) -> RoleRuntime:
+    async def open_role(self, role: str, cwd: str) -> RoleRuntime:
         state = self.store.read_state()
         name = state["sessions"].get(role) or f"guildhall-{self.store.quest_id}-{role}"
         session = self.manager.open_session(
@@ -116,26 +225,21 @@ class QuestRuntime:
         self.roles[role] = rt
         # state.json 记 session 名(命名规则逐字:guildhall-<quest-id>-<role>)
         self.store.update_state(sessions={**state["sessions"], role: name})
-        if system:
-            # 系统轮必须先收尾再发开场白:排队并发会导致 adapter 重复流式输出
-            await self._send_first(rt, first_message)
-        else:
-            task = asyncio.create_task(self._safe_send_user(rt, first_message))
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
         return rt
 
-    async def _send_first(self, rt: RoleRuntime, text: str) -> None:
-        try:
-            await rt.send_system(text)
-        except Exception as e:  # noqa: BLE001
-            self._record_role_error(rt.role, e)
+    def track(self, task: asyncio.Task) -> None:
+        self.tasks.add(task)
 
-    async def _safe_send_user(self, rt: RoleRuntime, text: str) -> None:
-        try:
-            await rt.send_user(text)
-        except Exception as e:  # noqa: BLE001
-            self._record_role_error(rt.role, e)
+        def done(finished: asyncio.Task) -> None:
+            self.tasks.discard(finished)
+            if finished.cancelled():
+                return
+            error = finished.exception()
+            if error is not None:
+                log.error("background task %s failed: %s", finished.get_name(), error)
+                self.store.set_error(f"后台任务异常:{error}")
+
+        task.add_done_callback(done)
 
     def _record_role_error(self, role: str, e: Exception) -> None:
         rt = self.roles.get(role)
@@ -155,6 +259,9 @@ class QuestRuntime:
 
     def get_role(self, role: str) -> Optional[RoleRuntime]:
         return self.roles.get(role)
+
+    def status(self) -> dict[str, Any]:
+        return {role: rt.status() for role, rt in self.roles.items()}
 
     async def close_all(self) -> None:
         self.closing = True
