@@ -66,3 +66,24 @@ def acceptance_gate_error(text: str) -> Optional[str]:
     if not has_nonempty_acceptance(text):
         return "quest.md 缺少可执行的「## 验收步骤」(至少一条编号条目):这是整条流水线唯一防止空单的闸门,放过去了后面全是垃圾。补上验收步骤再张贴。"
     return None
+
+
+# §2.5.1:负向测试的机械校验(纯字符串检查,不过模型)。
+# 提交对提交的比较观察不到工作区改动——负向测试必须作用于工作区当前状态。
+_DIFF_HEAD_RE = re.compile(r"\bdiff\s+HEAD(?:\s|$)")
+_DIFF_RANGE_RE = re.compile(r"\bdiff\s+\S+\.\.")
+
+
+def negative_step_violation(text: str) -> Optional[str]:
+    """「验收步骤」中标记为负向的条目若用了提交对提交比较,返回拒绝原因;None 表示可过。"""
+    for step in acceptance_steps(text):
+        if "负向" not in step:
+            continue
+        for cmd in re.findall(r"`([^`]+)`", step):
+            if "..." in cmd or _DIFF_RANGE_RE.search(cmd) or _DIFF_HEAD_RE.search(cmd):
+                return (
+                    f"负向验收步骤使用了提交对提交的比较(`{cmd}`),它观察不到工作区改动,"
+                    "这样的负向测试在结构上永远不会报警,拒绝写盘。"
+                    "负向测试的命令必须作用于工作区当前状态,请重写这一条。"
+                )
+    return None

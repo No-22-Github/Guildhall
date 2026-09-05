@@ -1,38 +1,37 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { api, STATE_COLOR, STATE_LABEL } from '../api'
 import type { QuestState, QuestSummary } from '../api'
+import { useQuestListStream } from '../useStatusStream'
 
 const ACTIVE: QuestState[] = ['drafting', 'posted', 'in_progress', 'appraising', 'appraised', 'disputed']
 
 export default function QuestList({ onOpen }: { onOpen: (id: string) => void }) {
   const [projects, setProjects] = useState<string[]>([])
-  const [quests, setQuests] = useState<Record<string, QuestSummary[]>>({})
   const [newPath, setNewPath] = useState('')
   const [newMsg, setNewMsg] = useState('')
   const [selectedProject, setSelectedProject] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
-  async function refresh() {
+  // quest 摘要走 SSE(§2.2),按 project 分组展示;projects 列表仍一次性拉取
+  const summaries = useQuestListStream()
+  const quests = useMemo(() => {
+    const map: Record<string, QuestSummary[]> = {}
+    for (const q of summaries) {
+      ;(map[q.project] ??= []).push(q)
+    }
+    return map
+  }, [summaries])
+
+  async function refreshProjects() {
     const ps = await api.listProjects()
     setProjects(ps.map((p) => p.path))
-    const map: Record<string, QuestSummary[]> = {}
-    for (const p of ps) {
-      try {
-        map[p.path] = await api.listQuests(p.path)
-      } catch {
-        map[p.path] = []
-      }
-    }
-    setQuests(map)
     if (!selectedProject && ps.length > 0) setSelectedProject(ps[0].path)
   }
 
   useEffect(() => {
     document.title = 'Guildhall 公会大厅'
-    refresh().catch((e) => setError(String(e)))
-    const t = setInterval(refresh, 3000)
-    return () => clearInterval(t)
+    refreshProjects().catch((e) => setError(String(e)))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -55,7 +54,7 @@ export default function QuestList({ onOpen }: { onOpen: (id: string) => void }) 
     try {
       await api.registerProject(newPath)
       setNewPath('')
-      await refresh()
+      await refreshProjects()
     } catch (e) {
       setError(String(e))
     }

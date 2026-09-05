@@ -2,8 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api, STATE_COLOR, STATE_LABEL } from '../api'
-import type { AgentRuntimeStatus, QuestDetail } from '../api'
 import { useEventStream } from '../useEventStream'
+import { useQuestStatusStream } from '../useStatusStream'
+import AgentStatusPanel, { displayToolName } from '../components/AgentStatusPanel'
 
 interface UserItem {
   kind: 'user'
@@ -51,10 +52,6 @@ function contentText(value: unknown): string {
 
 function hasValues(value: unknown): boolean {
   return Boolean(value && typeof value === 'object' && Object.keys(value as Record<string, unknown>).length)
-}
-
-function displayToolName(name: string): string {
-  return ({ Bash: 'Terminal', Read: 'ReadFile', Write: 'WriteFile', Edit: 'EditFile' } as Record<string, string>)[name] ?? name
 }
 
 /** 将 ACP 事件恢复为“文本段 → 工具 → 分割线 → 后续文本段”，并保留工具参数与结果。 */
@@ -154,38 +151,6 @@ function buildTimeline(events: { seq: number; env: any }[]): TimelineItem[] {
   return items
 }
 
-const ACTIVITY_LABEL: Record<AgentRuntimeStatus['activity'], string> = {
-  starting: '正在启动 Claude Code',
-  thinking: '正在思考',
-  responding: '正在回复',
-  tool: '正在使用工具',
-  steering: '正在处理你的补充',
-  waiting: '等待你的消息',
-  error: '运行异常',
-}
-
-function AgentStatus({ status }: { status?: AgentRuntimeStatus }) {
-  if (!status) return <span className="text-xs text-gray-400">Claude Code 会话未连接，发送消息时会重建</span>
-  const busy = status.busy
-  const label = status.active_tool
-    ? `正在运行 ${displayToolName(status.active_tool.name)}${status.active_tool.title ? `：${status.active_tool.title}` : ''}`
-    : ACTIVITY_LABEL[status.activity] ?? '状态未知'
-  const quiet = busy && status.seconds_since_event >= 60
-    ? ` · 已 ${Math.round(status.seconds_since_event)} 秒无新事件，可能卡住`
-    : busy && status.seconds_since_event >= 15
-      ? ` · ${Math.round(status.seconds_since_event)} 秒无新事件`
-      : ''
-  const context = status.context_size && status.context_used != null
-    ? ` · 上下文 ${Math.round((status.context_used / status.context_size) * 100)}%`
-    : ''
-  return (
-    <div className="flex min-w-0 items-center gap-2 text-xs text-gray-600" title={status.error ?? status.detail ?? undefined}>
-      <span className={`h-2 w-2 shrink-0 rounded-full ${status.activity === 'error' ? 'bg-red-500' : busy ? 'animate-pulse bg-emerald-500' : 'bg-gray-300'}`} />
-      <span className="truncate">{label}{status.detail && !status.active_tool ? ` · ${status.detail}` : ''}{quiet}{context}</span>
-    </div>
-  )
-}
-
 function ToolCard({ tool }: { tool: ToolItem }) {
   const running = tool.status !== 'completed' && tool.status !== 'failed' && tool.status !== 'cancelled'
   const statusLabel = tool.status === 'completed' ? '完成' : tool.status === 'failed' ? '失败' : tool.status === 'cancelled' ? '已取消' : '运行中'
@@ -227,7 +192,7 @@ function MarkdownMessage({ text }: { text: string }) {
 }
 
 export default function Chat({ questId, onBack, onGotoReview }: { questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
-  const [detail, setDetail] = useState<QuestDetail | null>(null)
+  const detail = useQuestStatusStream(questId)
   const [input, setInput] = useState('')
   const [questDraft, setQuestDraft] = useState<string | null>(null)
   const [error, setError] = useState('')
@@ -239,25 +204,32 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
   const flowRef = useRef<HTMLDivElement>(null)
   const lastReadEventCountRef = useRef(0)
 
-  async function refresh() {
-    const result = await api.getQuest(questId)
-    setDetail(result)
-    if (result.quest_md && generationRequested) {
-      setQuestDraft(result.quest_md)
-      setGenerationRequested(false)
-    } else if (generationRequested && result.state.error && !result.runtime?.receptionist?.busy) {
-      setGenerationRequested(false)
-      setError(result.state.error)
+  // 历史工具链(A → B → C)与运行中工具分开;运行中的那个由面板从 status 呈现
+  const completedTools = useMemo(() => {
+    const seen = new Map<string, string>()
+    const out: string[] = []
+    for (const { env } of events) {
+      const u = env.params?.update
+      if (!u || (u.sessionUpdate !== 'tool_call' && u.sessionUpdate !== 'tool_call_update')) continue
+      const id = u.toolCallId ?? ''
+      if (seen.has(id)) continue
+      const name = u._meta?.claudeCode?.toolName ?? u.title ?? '工具'
+      seen.set(id, name)
+      out.push(name)
     }
-    return result
-  }
+    return out
+  }, [events])
 
   useEffect(() => {
-    refresh().catch((e) => setError(String(e)))
-    const timer = setInterval(() => refresh().catch(() => {}), 2000)
-    return () => clearInterval(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [questId, generationRequested])
+    if (!detail || !generationRequested) return
+    if (detail.quest_md) {
+      setQuestDraft(detail.quest_md)
+      setGenerationRequested(false)
+    } else if (detail.state.error && !detail.runtime?.receptionist?.busy) {
+      setGenerationRequested(false)
+      setError(detail.state.error)
+    }
+  }, [detail, generationRequested])
 
   useEffect(() => {
     if (!followingLatest) return
@@ -300,7 +272,6 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
     setError('')
     try {
       await api.postMessage(questId, text)
-      await refresh()
     } catch (e) {
       setInput((current) => (current ? `${text}\n${current}` : text))
       setError(String(e))
@@ -315,7 +286,6 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
       if (!result.ok) setError(result.reason ?? '生成失败')
       else if (result.quest_md) setQuestDraft(result.quest_md)
       else setGenerationRequested(true)
-      await refresh()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -332,7 +302,6 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
       await api.putQuest(questId, text)
       await api.transition(questId, 'posted')
       setQuestDraft(null)
-      await refresh()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -352,6 +321,9 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
       setActionBusy(false)
     }
   }
+
+  // §2.4:需求单生成前只渲染对话栏并居中;生成后切成两栏。
+  const hasQuestPanel = questDraft != null || Boolean(detail?.quest_md)
 
   return (
     <div className="flex h-screen flex-col">
@@ -375,9 +347,12 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
         )}
       </header>
 
-      <div className="flex min-h-0 flex-1">
-        <div className="flex min-w-0 flex-1 flex-col border-r">
-          <div className="border-b bg-gray-50 px-4 py-2"><AgentStatus status={agentStatus} /></div>
+      <div className={hasQuestPanel ? 'flex min-h-0 flex-1' : 'flex min-h-0 flex-1 justify-center'}>
+        <div className={hasQuestPanel ? 'flex min-w-0 flex-1 flex-col border-r' : 'flex w-full max-w-3xl flex-col'}>
+          {!hasQuestPanel && error && (
+            <div className="m-3 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</div>
+          )}
+          <div className="border-b bg-gray-50 px-4 py-2"><AgentStatusPanel roleName="前台" status={agentStatus} completedTools={completedTools} /></div>
           <div className="relative min-h-0 flex-1">
             <div ref={flowRef} className="h-full space-y-3 overflow-y-auto p-4" onScroll={handleFlowScroll}>
               {timeline.map((item, index) => {
@@ -427,33 +402,31 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
           )}
         </div>
 
-        <div className="flex w-[42%] min-w-[360px] flex-col">
-          {error && <div className="m-3 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</div>}
-          {questDraft != null ? (
-            <div className="flex min-h-0 flex-1 flex-col p-3">
-              <h3 className="mb-2 text-sm font-semibold">需求单（已写入 quest.md，可直接手改）</h3>
-              <textarea className="min-h-0 flex-1 rounded border p-2 font-mono text-xs" value={questDraft} onChange={(event) => setQuestDraft(event.target.value)} />
-              <div className="mt-2 flex gap-2">
-                <button className="rounded bg-green-600 px-4 py-2 text-sm text-white" disabled={actionBusy} onClick={post}>张贴</button>
-                <button className="rounded border px-4 py-2 text-sm" onClick={() => setQuestDraft(null)}>收起编辑</button>
+        {hasQuestPanel && (
+          <div className="flex w-[42%] min-w-[360px] flex-col">
+            {error && <div className="m-3 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</div>}
+            {questDraft != null ? (
+              <div className="flex min-h-0 flex-1 flex-col p-3">
+                <h3 className="mb-2 text-sm font-semibold">需求单（已写入 quest.md，可直接手改）</h3>
+                <textarea className="min-h-0 flex-1 rounded border p-2 font-mono text-xs" value={questDraft} onChange={(event) => setQuestDraft(event.target.value)} />
+                <div className="mt-2 flex gap-2">
+                  <button className="rounded bg-green-600 px-4 py-2 text-sm text-white" disabled={actionBusy} onClick={post}>张贴</button>
+                  <button className="rounded border px-4 py-2 text-sm" onClick={() => setQuestDraft(null)}>收起编辑</button>
+                </div>
               </div>
-            </div>
-          ) : detail?.quest_md ? (
-            <div className="flex min-h-0 flex-1 flex-col p-3">
-              <h3 className="mb-2 text-sm font-semibold">quest.md {state === 'drafting' ? '（已落盘，可编辑后张贴）' : '（已张贴）'}</h3>
-              {state === 'drafting' ? (
-                <>
-                  <textarea className="min-h-0 flex-1 rounded border p-2 font-mono text-xs" value={detail.quest_md} onChange={(event) => setQuestDraft(event.target.value)} />
-                  <button className="mt-2 rounded bg-green-600 px-4 py-2 text-sm text-white" disabled={actionBusy} onClick={post}>张贴</button>
-                </>
-              ) : <pre className="min-h-0 flex-1 overflow-auto rounded border bg-gray-50 p-2 font-mono text-xs">{detail.quest_md}</pre>}
-            </div>
-          ) : (
-            <div className="flex flex-1 items-center justify-center text-sm text-gray-400">
-              {generationRequested ? 'Claude Code 正在生成，完成后会自动写入 quest.md…' : drafting ? '和前台聊清楚后，点「生成需求单」' : '…'}
-            </div>
-          )}
-        </div>
+            ) : (
+              <div className="flex min-h-0 flex-1 flex-col p-3">
+                <h3 className="mb-2 text-sm font-semibold">quest.md {state === 'drafting' ? '（已落盘，可编辑后张贴）' : '（已张贴）'}</h3>
+                {state === 'drafting' ? (
+                  <>
+                    <textarea className="min-h-0 flex-1 rounded border p-2 font-mono text-xs" value={detail?.quest_md ?? ''} onChange={(event) => setQuestDraft(event.target.value)} />
+                    <button className="mt-2 rounded bg-green-600 px-4 py-2 text-sm text-white" disabled={actionBusy} onClick={post}>张贴</button>
+                  </>
+                ) : <pre className="min-h-0 flex-1 overflow-auto rounded border bg-gray-50 p-2 font-mono text-xs">{detail?.quest_md}</pre>}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )

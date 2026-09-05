@@ -141,6 +141,34 @@ def build_app(context: AppContext) -> FastAPI:
         await flow.start_receptionist(rt, body.message)
         return {"id": store.quest_id, "state": sm.DRAFTING}
 
+    @app.get("/api/quests/stream")
+    async def quests_stream(request: Request) -> StreamingResponse:
+        """列表页 SSE(§2.2):全部项目的 quest 摘要,全量推送,同样最长 5s 心跳。
+
+        注册顺序注意:必须在 /api/quests/{quest_id} 之前,否则 "stream" 会被
+        当成 quest_id 抓走。
+        """
+        async def gen() -> AsyncIterator[str]:
+            loop = asyncio.get_running_loop()
+            last_sig: Optional[str] = None
+            last_push = 0.0
+            while True:
+                if await request.is_disconnected():
+                    return
+                data = st.list_all_quests()
+                sig = json.dumps(data, sort_keys=True, ensure_ascii=False)
+                now = loop.time()
+                if sig != last_sig or now - last_push >= 4.5:
+                    last_sig, last_push = sig, now
+                    yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.get("/api/quests/{quest_id}")
     async def get_quest(quest_id: str) -> dict[str, Any]:
         store = _store(quest_id)
@@ -151,6 +179,63 @@ def build_app(context: AppContext) -> FastAPI:
             "appraisal": store.read_appraisal(),
             "runtime": runtime.status() if runtime is not None else {},
         }
+
+    @app.get("/api/quests/{quest_id}/status/stream")
+    async def quest_status_stream(quest_id: str, request: Request) -> StreamingResponse:
+        """状态/运行态 SSE(§2.2):当前值,不做游标。
+
+        每次推送都是全量快照;断线重连后 EventSource 收到的第一条就是当前全量,
+        前端不需要补任何历史。quest_md 只在连接建立与状态转移的推送里带
+        (它可能很大,心跳/运行态变化不带)。变化检测排除 seconds_since_event
+        ——它只随时间走动,由最长 5s 一次的心跳负责刷新。
+        """
+        store = _store(quest_id)
+
+        async def gen() -> AsyncIterator[str]:
+            loop = asyncio.get_running_loop()
+            last_sig: Optional[str] = None
+            last_state: Optional[str] = None
+            last_qmd: Optional[str] = None
+            last_push = 0.0
+            first = True
+            while True:
+                if await request.is_disconnected():
+                    return
+                runtime = get_ctx().runtimes.get(quest_id)
+                status = runtime.status() if runtime is not None else {}
+                status_for_sig = {
+                    role: {k: v for k, v in s.items() if k != "seconds_since_event"}
+                    if isinstance(s, dict) else s
+                    for role, s in status.items()
+                }
+                state = store.read_state()
+                qmd = store.read_quest_md()
+                payload = {"state": state, "appraisal": store.read_appraisal(), "runtime": status}
+                # quest_md 必须进变化检测:生成/手改都发生在 drafting 内,不伴随状态转移,
+                # 不进签名的话前端永远收不到新需求单(心跳又刻意不带它)。
+                sig = json.dumps(
+                    {"state": state, "appraisal": payload["appraisal"], "runtime": status_for_sig, "quest_md": qmd},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                )
+                now = loop.time()
+                if sig != last_sig:
+                    body = dict(payload)
+                    if first or state["state"] != last_state or qmd != last_qmd:
+                        body["quest_md"] = qmd
+                    last_sig, last_state, last_qmd, last_push, first = sig, state["state"], qmd, now, False
+                    yield f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
+                elif now - last_push >= 4.5:  # 心跳:最长 5s 一次(0.5s 轮询粒度)
+                    last_push = now
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.put("/api/quests/{quest_id}/quest")
     async def put_quest(quest_id: str, request: Request) -> dict[str, str]:

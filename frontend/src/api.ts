@@ -28,6 +28,8 @@ export interface AppraisalCheck {
   step: string
   result: 'pass' | 'fail'
   evidence: string
+  /** 结构上无法满足(委托书的问题,不是实现的问题) */
+  unsatisfiable?: boolean
 }
 
 export interface Appraisal {
@@ -54,6 +56,7 @@ export interface AgentRuntimeStatus {
   seconds_since_event: number
   context_used: number | null
   context_size: number | null
+  thought_tail: string | null
   error: string | null
 }
 
@@ -130,6 +133,14 @@ export const api = {
 
 export function eventsUrl(id: string, role: string, offset: number): string {
   return `/api/quests/${id}/events/${role}?offset=${offset}`
+}
+
+export function statusStreamUrl(id: string): string {
+  return `/api/quests/${id}/status/stream`
+}
+
+export function questsStreamUrl(): string {
+  return '/api/quests/stream'
 }
 
 export const STATE_LABEL: Record<QuestState, string> = {

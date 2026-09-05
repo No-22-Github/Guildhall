@@ -247,6 +247,20 @@ def list_quests(project: str) -> list[dict[str, Any]]:
     return out
 
 
+def list_all_quests() -> list[dict[str, Any]]:
+    """全部项目的 quest 摘要(列表页 SSE 流的推送体,§2.2)。"""
+    root = layout.GUILDHALL_DIR / "projects"
+    if not root.exists():
+        return []
+    out = []
+    for pdir in sorted(root.iterdir()):
+        if not (pdir / ".project.json").exists():
+            continue
+        project = json.loads((pdir / ".project.json").read_text(encoding="utf-8"))["path"]
+        out.extend(list_quests(project))
+    return out
+
+
 def any_in_progress() -> Optional[str]:
     """同一时刻只允许一个 quest 处于 in_progress(§1 明确不做并发)。"""
     root = layout.GUILDHALL_DIR / "projects"

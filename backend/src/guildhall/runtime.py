@@ -25,6 +25,10 @@ log = logging.getLogger("guildhall.runtime")
 
 ROLES = ("receptionist", "adventurer", "appraiser")
 
+# 思考文本只保留尾部进运行态(§2.3.1):全量会把每次心跳撑爆,
+# 完整内容在 events/<role>.jsonl 里,前端需要时可从事件流取。
+THOUGHT_TAIL_CHARS = 2000
+
 
 class RoleRuntime:
     """一个活着的角色 session + 它的事件扇出。"""
@@ -42,6 +46,7 @@ class RoleRuntime:
         self.active_tool: Optional[dict[str, Any]] = None
         self.context_used: Optional[int] = None
         self.context_size: Optional[int] = None
+        self.thought_tail: Optional[str] = None
         self.last_event_at = time.time()
 
     # ---------- 扇出 ----------
@@ -51,9 +56,13 @@ class RoleRuntime:
         update = (env.get("params") or {}).get("update") or {}
         kind = update.get("sessionUpdate")
         if kind == "agent_thought_chunk":
+            text = (update.get("content") or {}).get("text")
+            if text:
+                self.thought_tail = ((self.thought_tail or "") + text)[-THOUGHT_TAIL_CHARS:]
             self.activity = "thinking"
             self.activity_detail = None
         elif kind == "agent_message_chunk":
+            self.thought_tail = None  # 新一轮输出开始了
             self.activity = "responding"
             self.activity_detail = None
         elif kind in ("tool_call", "tool_call_update"):
@@ -184,6 +193,7 @@ class RoleRuntime:
             "seconds_since_event": round(seconds, 1),
             "context_used": self.context_used,
             "context_size": self.context_size,
+            "thought_tail": self.thought_tail,
             "error": self.died,
         }
 
@@ -212,6 +222,7 @@ class QuestRuntime:
         name = state["sessions"].get(role) or f"guildhall-{self.store.quest_id}-{role}"
         session = self.manager.open_session(
             name,
+            role=role,
             resume_offset=int(state["offsets"].get(role) or 0),
             on_continuity_break=self._make_continuity_handler(role),
         )

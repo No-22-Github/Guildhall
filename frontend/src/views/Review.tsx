@@ -1,85 +1,69 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, STATE_COLOR, STATE_LABEL } from '../api'
-import type { AgentRuntimeStatus, Appraisal, QuestDetail } from '../api'
+import type { Appraisal, QuestDetail } from '../api'
 import { useEventStream } from '../useEventStream'
+import { useQuestStatusStream } from '../useStatusStream'
+import AgentStatusPanel from '../components/AgentStatusPanel'
 
-/** 冒险者/鉴定人的事件流摘要:工具调用行 + 最终文本。 */
-function RoleDigest({ questId, role, status }: { questId: string; role: string; status?: AgentRuntimeStatus }) {
+/** 冒险者/鉴定人的事件流摘要:三段状态面板(§2.3.2) + 最终文本。 */
+function RoleDigest({ questId, role, status }: { questId: string; role: string; status?: QuestDetail['runtime'][string] }) {
   // failed 页初次挂载时角色可能尚未恢复；connected 翻转后必须重建 SSE，
   // 否则旧连接只重放失败前的几条事件，后续工具/文本永远进不了页面。
   const events = useEventStream(questId, role, true, status?.connected ? 'connected' : 'offline')
   const digest = useMemo(() => {
+    const seen = new Map<string, string>()
     const tools: string[] = []
     let text = ''
     for (const { env } of events) {
       const u = env.params?.update
       if (!u) continue
-      if (u.sessionUpdate === 'tool_call') tools.push(u.title ?? u._meta?.claudeCode?.toolName ?? 'tool')
+      if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') {
+        const id = u.toolCallId ?? ''
+        if (!seen.has(id)) {
+          const name = u._meta?.claudeCode?.toolName ?? u.title ?? 'tool'
+          seen.set(id, name)
+          tools.push(name)
+        }
+      }
       if (u.sessionUpdate === 'agent_message_chunk') text += u.content?.text ?? ''
     }
     return { tools, text }
   }, [events])
 
   const roleName = role === 'adventurer' ? '冒险者' : '鉴定人'
-  const activity = status?.active_tool
-    ? `正在运行 ${status.active_tool.name}${status.active_tool.title ? `：${status.active_tool.title}` : ''}`
-    : status?.activity === 'starting' ? '正在启动 Claude Code'
-      : status?.activity === 'thinking' ? '正在思考'
-        : status?.activity === 'responding' ? '正在回复'
-          : status?.activity === 'tool' ? '正在使用工具'
-            : status?.activity === 'error' ? '运行异常'
-              : status ? '等待中' : '尚未启动'
-  const quiet = status?.busy && status.seconds_since_event >= 15
-    ? ` · ${Math.round(status.seconds_since_event)} 秒无新事件`
-    : ''
-  const context = status?.context_size && status.context_used != null
-    ? ` · 上下文 ${Math.round((status.context_used / status.context_size) * 100)}%`
-    : ''
 
   return (
     <div className="rounded border bg-gray-50 p-2 text-xs">
-      <div className="mb-1 flex items-center gap-2 font-semibold">
-        <span className={`h-2 w-2 rounded-full ${status?.activity === 'error' ? 'bg-red-500' : status?.busy ? 'animate-pulse bg-emerald-500' : 'bg-gray-300'}`} />
-        <span>{roleName} · {activity}{quiet}{context}</span>
-        <span className="ml-auto font-normal text-gray-400">事件 {events.length.toLocaleString()}</span>
-      </div>
-      <div className="text-gray-500">
-        {digest.tools.length > 0 ? `工具调用：${digest.tools.slice(-8).join(' → ')}` : status?.busy ? '事件流正在更新…' : '(还没有动作)'}
-      </div>
+      <AgentStatusPanel roleName={roleName} status={status} completedTools={digest.tools} right={<span>事件 {events.length.toLocaleString()}</span>} />
       {digest.text && <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-gray-700">{digest.text}</pre>}
     </div>
   )
 }
 
 export default function Review({ questId, onBack }: { questId: string; onBack: () => void }) {
-  const [detail, setDetail] = useState<QuestDetail | null>(null)
+  const detail = useQuestStatusStream(questId)
   const [diff, setDiff] = useState('')
   const [appraisal, setAppraisal] = useState<Appraisal | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
-  async function refresh() {
-    const d = await api.getQuest(questId)
-    setDetail(d)
-    if (['in_progress', 'appraising', 'appraised', 'disputed', 'settled', 'failed'].includes(d.state.state)) {
+  const state = detail?.state.state
+  const invalidated = appraisal?.invalidated === true
+
+  // diff / appraisal 不走状态流:状态流告知状态,内容仍按需拉取
+  useEffect(() => {
+    if (state && ['in_progress', 'appraising', 'appraised', 'disputed', 'settled', 'failed'].includes(state)) {
       api.getDiff(questId).then((r) => setDiff(r.diff)).catch(() => {})
     }
-    if (['appraised', 'disputed', 'settled'].includes(d.state.state)) {
+  }, [questId, state])
+
+  useEffect(() => {
+    if (state && ['appraised', 'disputed', 'settled'].includes(state)) {
       api.getAppraisal(questId).then(setAppraisal).catch(() => setAppraisal(null))
     } else {
       setAppraisal(null)
     }
-  }
-
-  useEffect(() => {
-    refresh().catch((e) => setError(String(e)))
-    const t = setInterval(() => refresh().catch(() => {}), 2000)
-    return () => clearInterval(t)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [questId])
-
-  const state = detail?.state.state
-  const invalidated = appraisal?.invalidated === true
+  }, [questId, state])
 
   useEffect(() => {
     document.title = `${questId.slice(-12)} · ${state ? STATE_LABEL[state] : ''} · Guildhall`
@@ -92,7 +76,6 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
     setError('')
     try {
       await api.transition(questId, to)
-      await refresh()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -105,7 +88,6 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
     setError('')
     try {
       await api.retryAdventurer(questId)
-      await refresh()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -118,7 +100,6 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
     setError('')
     try {
       await api.resumeAppraisal(questId)
-      await refresh()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -182,7 +163,6 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
               setError('')
               try {
                 await fetch(`/api/quests/${questId}/reappraise`, { method: 'POST' })
-                await refresh()
               } catch (e) {
                 setError(String(e))
               } finally {
@@ -258,11 +238,24 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
               <ul className="space-y-2">
                 {appraisal.checks.map((c) => {
                   const pass = c.result === 'pass' && !invalidated
+                  const unsatisfiable = c.unsatisfiable === true && !pass
                   return (
-                    <li key={c.index} className={`rounded border p-2 text-xs ${pass ? 'border-green-300 bg-green-50' : 'border-red-300 bg-red-50'}`}>
+                    <li
+                      key={c.index}
+                      className={`rounded border p-2 text-xs ${
+                        pass
+                          ? 'border-green-300 bg-green-50'
+                          : unsatisfiable
+                            ? 'border-amber-400 bg-amber-50'
+                            : 'border-red-300 bg-red-50'
+                      }`}
+                    >
                       <div className="font-medium">
-                        {pass ? '✓' : '✗'} #{c.index} {c.step}
+                        {pass ? '✓' : unsatisfiable ? '⚠' : '✗'} #{c.index} {c.step}
                       </div>
+                      {unsatisfiable && (
+                        <div className="mt-1 font-medium text-amber-700">结构上无法满足:问题出在委托书,不是实现。</div>
+                      )}
                       <div className="mt-1 whitespace-pre-wrap text-gray-600">{c.evidence}</div>
                     </li>
                   )

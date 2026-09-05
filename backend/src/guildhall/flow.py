@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import gitutil, prompts, statemachine as sm, store as st
+from .questmd import negative_step_violation
 from .runtime import QuestRuntime, RoleRuntime
 from .sandbox import SandboxManager
 
@@ -137,6 +138,12 @@ async def generate_quest(
         result = {"ok": False, "reason": gate, "raw": md}
         receiver.publish_synthetic({"method": "_guildhall/generation_end", "params": {"ok": False, "reason": gate}})
         return result
+    violation = negative_step_violation(md)
+    if violation:
+        # §2.5.1:负向测试的机械校验,拒绝写盘,把原因回给 receptionist 让它重写
+        result = {"ok": False, "reason": violation, "raw": md}
+        receiver.publish_synthetic({"method": "_guildhall/generation_end", "params": {"ok": False, "reason": violation}})
+        return result
     store.write_quest_md(md)
     store.set_error(None)
     receiver.publish_synthetic({"method": "_guildhall/generation_end", "params": {"ok": True}})
@@ -228,7 +235,7 @@ def recover_generated_quest(store: st.QuestStore) -> Optional[str]:
     flush_message()
     for raw in reversed(messages):
         md = normalize_quest_md(store, raw)
-        if md is None or st.acceptance_gate_error(md):
+        if md is None or st.acceptance_gate_error(md) or negative_step_violation(md):
             continue
         store.write_quest_md(md)
         store.set_error(None)
@@ -339,7 +346,7 @@ async def dispatch_adventurer(
 
     quest_md = store.read_quest_md() or ""
     session_name = f"guildhall-{store.quest_id}-adventurer"
-    session = manager.open_session(session_name)
+    session = manager.open_session(session_name, role="adventurer")
     await session.start()
     try:
         await session.new_session(cwd=str(worktree))
@@ -392,7 +399,7 @@ async def run_appraisal(rt: QuestRuntime, manager: SandboxManager) -> None:
 
     quest_md = store.read_quest_md() or ""
     session_name = f"guildhall-{store.quest_id}-appraiser"
-    session = manager.open_session(session_name)
+    session = manager.open_session(session_name, role="appraiser")
     await session.start()
     await session.new_session(cwd=str(worktree))
     state = store.read_state()
@@ -432,6 +439,12 @@ async def run_appraisal(rt: QuestRuntime, manager: SandboxManager) -> None:
 
     if appraisal is not None:
         appraisal["invalidated"] = not integrity_ok
+        if integrity_ok:
+            # 确定性防线(§2.6):服务端直接从 diff 抓偷改测试,不依赖 appraiser 的自觉。
+            # 真模型的判断是 e2e 的职责,这里只做机械兜底。
+            diff_text = gitutil.diff_vs_base(worktree, state.get("base_commit"))
+            if detect_touched_tests(diff_text):
+                appraisal["touched_tests"] = True
         store.write_appraisal(appraisal)
         store.set_error(None if integrity_ok else "appraiser 结束时 worktree 的 tracked 文件与开始时不一致:本次验收结论已整份作废(invalidated)。")
 
@@ -467,6 +480,40 @@ def parse_appraisal(raw: str) -> Optional[dict[str, Any]]:
     if not isinstance(data, dict) or "checks" not in data:
         return None
     return data
+
+
+# 改了这些路径 = 改了测试/断言/CI(§2.6 确定性检测的判定面)
+_TEST_PATH_RE = re.compile(
+    r"(?:^|/)(?:tests?|spec|__tests__)/(?:|$)"        # 测试目录本身
+    r"|(?:^|/)test_[^/]+\.py$"                        # test_*.py
+    r"|(?:^|/)[^/]+_test\.(?:py|go|rb|rs)$"           # *_test.py/go/rb/rs
+    r"|(?:^|/)[^/]+\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs)$"  # *.test.* / *.spec.*
+    r"|(?:^|/)conftest\.py$"
+    r"|(?:^|/)(?:jest|vitest)\.config\."
+)
+_CI_PATH_RE = re.compile(
+    r"(?:^|/)\.github/workflows/"
+    r"|(?:^|/)\.circleci/"
+    r"|(?:^|/)\.gitlab-ci\.yml$"
+    r"|(?:^|/)(?:Jenkinsfile|azure-pipelines\.yml|bitrise\.yml)$"
+)
+
+
+def detect_touched_tests(diff: str) -> bool:
+    """从 unified diff 里机械判定是否动了测试文件、断言或 CI 配置。
+
+    纯字符串检查,不过模型;是 touched_tests 的确定性兜底(M5 负向一,
+    docs/m1-per-role-model.md 同期的测试基建)。
+    """
+    touched_paths: set[str] = set()
+    for line in diff.splitlines():
+        if line.startswith(("--- ", "+++ ")):
+            path = line[4:].strip()
+            if path == "/dev/null" or path.startswith(("a/", "b/")):
+                path = path[2:]
+            if path and path != "/dev/null":
+                touched_paths.add(path)
+    return any(_TEST_PATH_RE.search(p) or _CI_PATH_RE.search(p) for p in touched_paths)
 
 
 def _safe_transition(store: st.QuestStore, to: str) -> None:

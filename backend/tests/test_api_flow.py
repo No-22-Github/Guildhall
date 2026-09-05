@@ -647,6 +647,103 @@ def test_sse_replay_from_jsonl(client, wired, demo_repo):
     assert "第二句话" in tail
 
 
+@pytest.fixture()
+def live_server(tmp_guildhall, fake_acp, demo_repo):
+    """真实 uvicorn(线程内)+ httpx:TestClient 在当前 starlette 版本下会整包缓冲
+    流式响应,无限 SSE(状态流)必须走真 socket 才能测。"""
+    import httpx
+    import socket
+    import threading
+    import uvicorn
+
+    from guildhall import api
+    from guildhall.config import Config, SandboxAgentConfig
+    from urllib.parse import urlparse
+
+    u = urlparse(fake_acp.base_url)
+    config = Config(
+        sandbox_agent=SandboxAgentConfig(host=u.hostname, port=u.port, autostart=False),
+        agent_name="claude",
+    )
+    context = api.AppContext(config)
+    app = api.build_app(context)
+
+    @app.on_event("startup")
+    async def _startup():
+        await context.manager.ensure_running()
+        await context.manager.assert_agent_available()
+        api.ctx = context
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(100):
+        try:
+            if httpx.get(f"{base}/api/projects", timeout=0.5).status_code == 200:
+                break
+        except Exception:  # noqa: BLE001
+            time.sleep(0.05)
+    else:
+        raise RuntimeError("live server did not start")
+    yield base
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def test_status_stream_reconnect_delivers_full_snapshot(live_server, wired, demo_repo):
+    """§2.2 测试 4:状态流不做游标,断线重连后第一条就是全量当前状态,不是增量。"""
+    import httpx
+
+    base = live_server
+
+    def first_status_event() -> dict:
+        with httpx.Client(timeout=10.0) as h:
+            with h.stream("GET", f"{base}/api/quests/{qid}/status/stream") as resp:
+                assert resp.status_code == 200
+                for line in resp.iter_lines():
+                    if line.startswith("data:"):
+                        return json.loads(line[5:].strip())
+        raise AssertionError("status stream closed without pushing")
+
+    with httpx.Client(timeout=30.0) as h:
+        h.post(f"{base}/api/projects", json={"path": str(demo_repo)})
+        r = h.post(f"{base}/api/quests", json={"project": str(demo_repo), "message": "做一个可验收改动"})
+        assert r.status_code == 201, r.text
+        qid = r.json()["id"]
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            body = h.get(f"{base}/api/quests/{qid}").json()
+            status = body.get("runtime", {}).get("receptionist")
+            if status and not status["busy"]:
+                break
+            time.sleep(0.05)
+        r = h.post(f"{base}/api/quests/{qid}/generate")
+        assert r.json().get("ok") is True, r.text
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if h.get(f"{base}/api/quests/{qid}").json()["quest_md"] is not None:
+                break
+            time.sleep(0.05)
+        full = h.get(f"{base}/api/quests/{qid}").json()
+
+    first = first_status_event()
+    assert first["state"]["state"] == "drafting"
+    assert first["quest_md"] is not None  # 首推带 quest_md
+    assert "receptionist" in first["runtime"]
+
+    # 断线重连(新连接、不带任何游标):第一条必须等于当前全量
+    second = first_status_event()
+    assert second["state"] == full["state"]
+    assert second["quest_md"] is not None
+    assert "receptionist" in second["runtime"]
+    assert second["state"]["history"], "全量快照必须带完整 state.json,不是增量"
+
+
 def test_in_progress_blocks_quest_md_edit_and_second_dispatch(client, wired, demo_repo, tmp_guildhall):
     client.post("/api/projects", json={"path": str(demo_repo)})
     r = client.post("/api/quests", json={"project": str(demo_repo), "message": "改点东西"})
