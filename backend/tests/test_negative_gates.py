@@ -129,8 +129,7 @@ index 3333333..4444444 100644
 
     # 走「解析 + 检查」的完整机械链路(绕过模型):模型谎报 false 也拦得住
     appraisal = parse_appraisal('{"checks": [], "touched_tests": false, "out_of_scope_files": [], "summary": "全绿"}')
-    assert appraisal is not None
-    assert appraisal["touched_tests"] is False
+    assert appraisal is None  # Empty checks must never validate
     assert detect_touched_tests(cheat_diff) is True  # 机械判定推翻模型谎报
 
 def test_pipeline_deterministic_touched_tests_overrides_model_lie(client, wired, demo_repo, tmp_guildhall):
@@ -149,7 +148,7 @@ def test_pipeline_deterministic_touched_tests_overrides_model_lie(client, wired,
     wired.set_script("adventurer", sneaky_adventurer)
 
     async def lying_appraiser(text):
-        appraisal = {"checks": [{"index": 1, "step": "任意", "result": "pass", "evidence": "ran"}],
+        appraisal = {"checks": [{"index": 1, "step": "`python -m src.main` 退出码为 0", "result": "pass", "evidence": "ran"}, {"index": 2, "step": "【负向】把 main() 的返回值改错一位,测试必须失败", "result": "pass", "evidence": "ran"}],
                      "touched_tests": False, "out_of_scope_files": [], "summary": "模型声称什么都没改。"}
         return ([chunk("...")], json.dumps(appraisal), "end_turn")
 

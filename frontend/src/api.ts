@@ -16,6 +16,7 @@ export interface StateJson {
   branch: string
   worktree: string
   base_commit: string | null
+  delivery_commit?: string
   sessions: Record<string, string | null>
   offsets: Record<string, number>
   integrity: Record<string, { before: string | null; after: string | null; ok: boolean | null }>
@@ -128,6 +129,8 @@ export const api = {
       body: JSON.stringify({ to }),
     }),
   getDiff: (id: string) => req<{ diff: string; base_commit: string | null }>(`/api/quests/${id}/diff`),
+  delivery: (id: string) => req<{target_branch: string; ready: boolean; reason: string | null; files: string[]}>(`/api/quests/${id}/delivery`),
+  reappraise: (id: string) => req<{ok: boolean}>(`/api/quests/${id}/reappraise`, {method: 'POST'}),
   getAppraisal: (id: string) => req<Appraisal>(`/api/quests/${id}/appraisal`),
 }
 

@@ -78,8 +78,8 @@ def wired(fake_acp):
     async def appraiser_script(text: str):
         appraisal = {
             "checks": [
-                {"index": 1, "step": "python -m src.main 退出码为 0", "result": "pass", "evidence": "ran"},
-                {"index": 2, "step": "负向", "result": "pass", "evidence": "ran"},
+                {"index": 1, "step": "`python -m src.main` 退出码为 0", "result": "pass", "evidence": "ran"},
+                {"index": 2, "step": "【负向】把 main() 的返回值改错一位,测试必须失败", "result": "pass", "evidence": "ran"},
             ],
             "touched_tests": False,
             "out_of_scope_files": [],
@@ -525,7 +525,7 @@ def test_touched_tests_goes_disputed(client, wired, demo_repo, tmp_guildhall):
     cheat.write_text("def test_main():\n    assert True  # 被偷改的断言\n")
 
     async def cheating_appraiser(text):
-        appraisal = {"checks": [{"index": 1, "step": "任意", "result": "pass", "evidence": "ran"}],
+        appraisal = {"checks": [{"index": 1, "step": "`python -m src.main` 退出码为 0", "result": "pass", "evidence": "ran"}, {"index": 2, "step": "【负向】把 main() 的返回值改错一位,测试必须失败", "result": "pass", "evidence": "ran"}],
                      "touched_tests": True, "out_of_scope_files": [], "summary": "diff 里改了测试断言。"}
         return ([chunk("...")], json.dumps(appraisal), "end_turn")
 
@@ -552,7 +552,7 @@ def test_appraiser_pollution_invalidates(client, wired, demo_repo, tmp_guildhall
         # appraiser 污染 worktree 后不再还原(哨兵:污染内容出现才吐结论)
         while "appraiser 忘了还原" not in pollution.read_text():
             await asyncio.sleep(0.05)
-        appraisal = {"checks": [{"index": 1, "step": "任意", "result": "pass", "evidence": "ran"}],
+        appraisal = {"checks": [{"index": 1, "step": "`python -m src.main` 退出码为 0", "result": "pass", "evidence": "ran"}, {"index": 2, "step": "【负向】把 main() 的返回值改错一位,测试必须失败", "result": "pass", "evidence": "ran"}],
                      "touched_tests": False, "out_of_scope_files": [], "summary": "全过。"}
         return ([chunk("...")], json.dumps(appraisal), "end_turn")
 

@@ -8,6 +8,8 @@
 **鉴定人不听冒险者吹牛,只看货**(它看不到 adventurer 的任何输出,这是自动验收唯一的价值来源);
 过了才轮到你最后过目。
 
+本轮可靠性修订与明确的规格调整见 [docs/reliability.md](docs/reliability.md)。接受操作现在会预览并快进合并已验收代码，历史单据需先重验生成快照。
+
 ## 三条设计底线
 
 - 委托书必须有可执行的验收步骤,且至少一条负向测试。
@@ -49,7 +51,7 @@ cd frontend && pnpm install && pnpm dev   # http://127.0.0.1:5173
 
 ```bash
 cd backend
-uv run pytest tests/ -q        # 49 条:状态机/磁盘布局/管线,含 M1、M5 与前台异步/插话回归
+uv run pytest tests/ -q        # 状态机、契约闸门、恢复互斥、SSE 续读及真实 Git 交付回归
 ../scripts/e2e_check.sh        # 上面全部 + 真模型 M5 负向(手工构造偷改测试的 diff,真 appraiser 必须报 touched_tests=true)
 ```
 
@@ -58,10 +60,9 @@ M5 负向二(appraiser 弄脏 worktree → 结论整份作废)是确定性闸门
 
 ## 实现要点(与规格书的对应)
 
-- **状态机是封闭转移表**,表外转移 409;进入 `posted` 前闸门校验 quest.md 含非空「## 验收步骤」;
+- **状态机是封闭转移表**,表外转移 409;进入 `posted` 前闸门校验 quest.md 含非空验收、负向条目及范围白名单;
   `appraised` 不自动进 `settled`。
-- **三份 prompt 契约逐字实现**(`backend/src/guildhall/prompts.py`),lore.md 注入与
-  quest 模板填充是仅有的两处程序注入。
+- **三份角色 prompt**(`backend/src/guildhall/prompts.py`),保留角色分工与报告隔离；修订项和新增输入见 docs/reliability.md。
 - **worktree 隔离**:进入 `in_progress` 才建 worktree 和分支 `guildhall/<quest-id>`,
   diff 一律相对创建时刻的 HEAD(记在 `state.json.base_commit`)。
 - **「进出一致」校验**(§6.2):`git diff HEAD` 的 sha256 对比,不是 `git status --porcelain`。
@@ -69,7 +70,7 @@ M5 负向二(appraiser 弄脏 worktree → 结论整份作废)是确定性闸门
   `invalidated: true` 并转 `disputed`,前端不展示绿勾。
 - **事件流**:sandbox-agent 的 ACP SSE `id:` 是权威游标;guildhall 旁路写
   `events/<role>.jsonl` 并把上游游标快照进 `state.json.offsets`;
-  Web 端 SSE 逐事件转发,前端拿 offset 续读,后端不做去重。
+  Web 端使用 JSONL 行号，Last-Event-ID 从下一条续读；后端仅跳过订阅与重放的重叠部分。
 - **前台长轮次不阻塞 HTTP**:新建后只等 ACP session 就绪就进入对话页;角色契约与
   用户开场白合在同一首轮。运行态由 thought/message/tool/usage 事件实时推导,
   工作中追加消息走 claude-agent-acp 的 `_session/steering` 注入当前 turn。

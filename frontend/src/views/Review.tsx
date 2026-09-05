@@ -46,6 +46,8 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
   const [appraisal, setAppraisal] = useState<Appraisal | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [confirmDelivery, setConfirmDelivery] = useState(false)
+  const [delivery, setDelivery] = useState<Awaited<ReturnType<typeof api.delivery>> | null>(null)
 
   const state = detail?.state.state
   const invalidated = appraisal?.invalidated === true
@@ -67,6 +69,11 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
 
   useEffect(() => {
     document.title = `${questId.slice(-12)} · ${state ? STATE_LABEL[state] : ''} · Guildhall`
+  }, [questId, state])
+  useEffect(() => {
+    if (state && ['appraised', 'disputed'].includes(state)) {
+      api.delivery(questId).then(setDelivery).catch((e) => setError(String(e)))
+    }
   }, [questId, state])
   const canAccept = state === 'appraised' || state === 'disputed'
   const canAbandon = state === 'disputed'
@@ -153,7 +160,7 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
             </button>
           </>
         )}
-        {state === 'appraising' && (
+        {state && ['appraising', 'appraised', 'disputed'].includes(state) && (
           <button
             className="rounded border border-amber-400 px-3 py-2 text-xs text-amber-700 disabled:opacity-50"
             disabled={busy}
@@ -162,7 +169,7 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
               setBusy(true)
               setError('')
               try {
-                await fetch(`/api/quests/${questId}/reappraise`, { method: 'POST' })
+                await api.reappraise(questId)
               } catch (e) {
                 setError(String(e))
               } finally {
@@ -174,8 +181,8 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
           </button>
         )}
         {canAccept && (
-          <button className="rounded bg-green-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50" disabled={busy} onClick={() => decide('settled')}>
-            接受
+          <button className="rounded bg-green-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50" disabled={busy || !delivery?.ready} onClick={() => setConfirmDelivery(true)}>
+            接受并合并
           </button>
         )}
         {canAbandon && (
@@ -185,6 +192,13 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
         )}
       </header>
 
+      {confirmDelivery && canAccept && delivery?.ready && <div className="border-b bg-amber-50 p-3 text-sm">
+        {state === 'disputed' && <span>本单有争议，请确认已阅读全部验收证据。 </span>}
+        <button disabled={busy} className="rounded bg-green-700 px-3 py-2 text-white disabled:opacity-50" onClick={() => { setConfirmDelivery(false); void decide('settled') }}>确认合并至 {delivery.target_branch}</button>
+        <button className="ml-3" onClick={() => setConfirmDelivery(false)}>取消</button>
+      </div>}
+      {delivery && canAccept && <div className="border-b bg-blue-50 p-3 text-sm">交付目标：{delivery.target_branch} · {delivery.files.length} 个文件{delivery.reason && <span className="ml-2 text-red-700">{delivery.reason}</span>}</div>}
+      {detail?.state.delivery_commit && <div className="border-b p-3 text-sm">交付提交：{detail.state.delivery_commit}</div>}
       {error && <div className="rounded border border-red-300 bg-red-50 p-2 text-sm text-red-700">{error}</div>}
 
       {detail?.state.error && (
@@ -230,7 +244,7 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
           )}
           {appraisal?.touched_tests && (
             <div className="mb-2 rounded border-2 border-red-500 bg-red-100 p-3 text-sm font-semibold text-red-800">
-              ⛔ 鉴定人发现 diff 里改了测试文件/断言/CI 配置——最常见的作弊路径,即使看起来合理也要人工确认。
+              ⚠ 测试或 CI 有变更，请检查是否新增覆盖、削弱断言或修改检查条件。此提示与逐项验收结果分别展示。
             </div>
           )}
           {appraisal ? (

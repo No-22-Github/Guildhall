@@ -34,7 +34,7 @@ def head_commit(repo: Path) -> str:
 
 def diff_head_sha256(workdir: Path) -> str:
     """`git diff HEAD` 的 sha256——「进出一致」的唯一度量(§6.2)。"""
-    p = _run(["diff", "HEAD"], cwd=workdir, check=False)
+    p = _run(["diff", "HEAD"], cwd=workdir)
     patch = p.stdout
     return "sha256:" + hashlib.sha256(patch.encode("utf-8")).hexdigest()
 
@@ -56,3 +56,29 @@ def diff_vs_base(worktree: Path, base_commit: str | None) -> str:
     if base_commit:
         return _run(["diff", base_commit], cwd=worktree, check=False).stdout
     return _run(["diff", "HEAD"], cwd=worktree, check=False).stdout
+
+
+def tracked_snapshot(workdir: Path) -> dict:
+    """Protect exact bytes, modes and HEAD, including binary files and staged additions."""
+    import os
+    names = _run(["ls-files", "-z"], cwd=workdir).stdout.split("\0")
+    files = {}
+    for name in sorted(set(filter(None, names))):
+        path = Path(workdir) / name
+        if path.is_symlink():
+            data = os.readlink(path).encode()
+        elif path.is_file():
+            data = path.read_bytes()
+        else:
+            files[name] = None
+            continue
+        files[name] = [path.lstat().st_mode, hashlib.sha256(data).hexdigest()]
+    return {"head": head_commit(workdir), "index": _run(["write-tree"], cwd=workdir).stdout.strip(), "files": files}
+
+
+def changed_paths(workdir: Path, base: str) -> list[str]:
+    return list(filter(None, _run(["diff", "--name-only", "--no-renames", "-z", base], cwd=workdir).stdout.split("\0")))
+
+
+def untracked_paths(workdir: Path) -> list[str]:
+    return list(filter(None, _run(["ls-files", "--others", "--exclude-standard", "-z"], cwd=workdir).stdout.split("\0")))

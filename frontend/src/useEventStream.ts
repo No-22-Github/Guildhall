@@ -38,6 +38,7 @@ export function useEventStream(
     }
 
     const es = new EventSource(eventsUrl(questId, role, 0))
+    es.addEventListener("end", () => es.close())
     es.onmessage = (m) => {
       const seq = Number(m.lastEventId)
       let env: any

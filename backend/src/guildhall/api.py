@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from . import flow, gitutil, layout, statemachine as sm, store as st
+from . import delivery, flow, gitutil, layout, statemachine as sm, store as st
 from .runtime import QuestRuntime, RoleRuntime
 from .sandbox import SandboxManager
 
@@ -69,8 +69,8 @@ def _store(quest_id: str) -> st.QuestStore:
 
 
 def _guard_quest_md_writable(state: str) -> None:
-    if state == sm.IN_PROGRESS:
-        raise HTTPException(409, "in_progress 状态下不许改 quest.md")
+    if state != sm.DRAFTING:
+        raise HTTPException(409, "委托书已冻结；只有 drafting 状态可以修改")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +244,10 @@ def build_app(context: AppContext) -> FastAPI:
         text = (await request.body()).decode("utf-8")
         if not text.strip():
             raise HTTPException(400, "quest.md 不能置空")
+        reason = st.acceptance_gate_error(text)
+        if reason:
+            store.set_error(reason)
+            raise HTTPException(409, reason)
         store.write_quest_md(text)
         return {"ok": "true"}
 
@@ -282,6 +286,7 @@ def build_app(context: AppContext) -> FastAPI:
         (§3 表格外的辅助路由:否则服务端无法从聊天流里可靠截出 quest.md。)
         """
         store = _store(quest_id)
+        _guard_quest_md_writable(store.read_state()["state"])
         rt = get_ctx().runtime(store)
         return flow.request_generate_quest(rt)
 
@@ -290,33 +295,34 @@ def build_app(context: AppContext) -> FastAPI:
         if role not in ("receptionist", "adventurer", "appraiser"):
             raise HTTPException(404, f"unknown role: {role}")
         store = _store(quest_id)
-        # 浏览器 EventSource 断线重连自动带 Last-Event-ID;query offset 优先
-        if offset < 0:
-            lei = request.headers.get("last-event-id", "")
-            offset = int(lei) if lei.isdigit() else 0
+        # Last-Event-ID identifies the last received row, resume after it.
+        lei = request.headers.get("last-event-id", "")
+        offset = int(lei) + 1 if lei.isdigit() else max(0, offset)
         rt = get_ctx().runtime(store)
         rt_role: Optional[RoleRuntime] = rt.roles.get(role)
 
         async def gen() -> AsyncIterator[str]:
-            # 1) 重放 jsonl(权威持久层)到当前行数
-            lines = store.read_events(role, offset)
-            for i, env in enumerate(lines):
-                yield sse_line(offset + i, env)
-            last = offset + len(lines)
-            # 2) 订阅活流,跳过重放已覆盖的行,只透传新事件
-            if rt_role is not None:
-                q = rt_role.subscribe()
-                try:
-                    while True:
-                        line_no, env = await q.get()
-                        if line_no < last:
-                            continue
+            q = rt_role.subscribe() if rt_role is not None else None
+            try:
+                lines = store.read_events(role, offset)
+                for i, env in enumerate(lines):
+                    yield sse_line(offset + i, env)
+                last = offset + len(lines)
+                if q is None:
+                    yield "event: end\ndata: {}\n\n"
+                    return
+                while not await request.is_disconnected():
+                    try:
+                        line_no, env = await asyncio.wait_for(q.get(), timeout=10)
+                    except asyncio.TimeoutError:
+                        yield ": heartbeat\n\n"
+                        continue
+                    if line_no >= last:
                         yield sse_line(line_no, env)
                         last = line_no + 1
-                finally:
+            finally:
+                if rt_role is not None and q is not None:
                     rt_role.unsubscribe(q)
-            else:
-                yield "event: end\ndata: {}\n\n"  # 没有活 session:重放完即止
 
         return StreamingResponse(
             gen(),
@@ -335,14 +341,28 @@ def build_app(context: AppContext) -> FastAPI:
         except sm.InvalidTransition as e:
             raise HTTPException(409, str(e))
 
+        rt = get_ctx().runtime(store)
+        if to in (sm.APPRAISING, sm.SETTLED) and rt.phase_busy():
+            raise HTTPException(409, "当前阶段仍在运行，不能同时启动验收或交付")
         # 转移前副作用闸门
         if to == sm.POSTED:
             _guard_quest_md_writable(state["state"])
+            if any(not task.done() for task in rt.tasks):
+                raise HTTPException(409, "前台仍在工作，请等待生成结束后张贴")
         if to == sm.IN_PROGRESS:
+            reason = store.check_postable()
+            if reason:
+                raise HTTPException(409, reason)
             busy = st.any_in_progress()
             if busy and busy != quest_id:
                 raise HTTPException(409, f"同一时刻只允许一个 quest 处于 in_progress(当前:{busy})")
 
+        if to == sm.SETTLED:
+            try:
+                delivery.accept(store)
+            except RuntimeError as exc:
+                store.set_error(str(exc))
+                raise HTTPException(409, str(exc))
         try:
             new_state = store.transition(to)
         except st.GateRejected as e:
@@ -355,12 +375,11 @@ def build_app(context: AppContext) -> FastAPI:
             await rt.close_all()
         elif to == sm.IN_PROGRESS:
             rt = get_ctx().runtime(store)
-            asyncio.create_task(flow.dispatch_adventurer(rt, get_ctx().manager))
+            rt.start_phase(lambda: flow.dispatch_adventurer(rt, get_ctx().manager))
         elif to == sm.APPRAISING:
             # 服务重启恢复路径:人工把 in_progress 推进到 appraising 时,补跑验收
             rt = get_ctx().runtime(store)
-            if not any(t.get_name() == f"appraise:{quest_id}" for t in rt.tasks):
-                asyncio.create_task(_named_appraise(rt, quest_id))
+            rt.start_phase(lambda: _named_appraise(rt, quest_id))
         elif to in (sm.SETTLED, sm.WITHDRAWN):
             rt = get_ctx().runtime(store)
             await rt.close_all()
@@ -375,10 +394,17 @@ def build_app(context: AppContext) -> FastAPI:
         (§3 表格外的辅助路由,与 /generate 同理。)
         """
         store = _store(quest_id)
-        if store.read_state()["state"] != sm.APPRAISING:
-            raise HTTPException(409, "只有 appraising 状态能重跑验收")
+        if store.read_state()["state"] not in (sm.APPRAISING, sm.APPRAISED, sm.DISPUTED):
+            raise HTTPException(409, "只有验收阶段或验收结束的单据能重新验收")
         rt = get_ctx().runtime(store)
-        asyncio.create_task(_named_appraise(rt, quest_id))
+        if rt.phase_busy():
+            raise HTTPException(409, "当前阶段仍在运行，请等待结束后再恢复")
+        state = store.read_state()
+        if state["state"] != sm.APPRAISING:
+            state["history"].append({"at": st.now_iso(), "from": state["state"], "to": sm.APPRAISING, "recovery": "reappraise"})
+            state.update(state=sm.APPRAISING, error=None, review_snapshot=None, delivery_commit=None)
+            store.write_state(state)
+        rt.start_phase(lambda: _named_appraise(rt, quest_id))
         return {"ok": True}
 
     @app.post("/api/quests/{quest_id}/retry-adventurer")
@@ -388,6 +414,9 @@ def build_app(context: AppContext) -> FastAPI:
         state = store.read_state()
         if state.get("state") != sm.FAILED:
             raise HTTPException(409, "只有 failed 状态能重试冒险者")
+        rt = get_ctx().runtime(store)
+        if rt.phase_busy():
+            raise HTTPException(409, "当前阶段仍在运行，请等待结束后再恢复")
         failure = state.get("history", [])[-1] if state.get("history") else {}
         if failure.get("from") != sm.IN_PROGRESS:
             raise HTTPException(409, "该失败不是发生在冒险者阶段，不能从这里重试")
@@ -399,7 +428,7 @@ def build_app(context: AppContext) -> FastAPI:
         except RuntimeError as e:
             raise HTTPException(409, str(e))
         rt = get_ctx().runtime(store)
-        asyncio.create_task(flow.dispatch_adventurer(rt, get_ctx().manager, reuse_worktree=True))
+        rt.start_phase(lambda: flow.dispatch_adventurer(rt, get_ctx().manager, reuse_worktree=True))
         return {"ok": True, "state": new_state["state"]}
 
     @app.post("/api/quests/{quest_id}/resume-appraisal")
@@ -409,6 +438,9 @@ def build_app(context: AppContext) -> FastAPI:
         state = store.read_state()
         if state.get("state") != sm.FAILED:
             raise HTTPException(409, "只有 failed 状态能恢复到验收")
+        rt = get_ctx().runtime(store)
+        if rt.phase_busy():
+            raise HTTPException(409, "当前阶段仍在运行，请等待结束后再恢复")
         failure = state.get("history", [])[-1] if state.get("history") else {}
         if failure.get("from") != sm.IN_PROGRESS:
             raise HTTPException(409, "该失败不是发生在冒险者阶段，不能直接开始验收")
@@ -436,8 +468,20 @@ def build_app(context: AppContext) -> FastAPI:
         except (RuntimeError, sm.InvalidTransition) as e:
             raise HTTPException(409, str(e))
         rt = get_ctx().runtime(store)
-        asyncio.create_task(_named_appraise(rt, quest_id))
+        if rt.phase_busy():
+            raise HTTPException(409, "当前阶段仍在运行，请等待结束后再恢复")
+        rt.start_phase(lambda: _named_appraise(rt, quest_id))
         return {"ok": True, "state": new_state["state"]}
+
+    @app.get("/api/quests/{quest_id}/delivery")
+    async def delivery_preview(quest_id: str):
+        store = _store(quest_id)
+        if store.read_state()["state"] not in (sm.APPRAISED, sm.DISPUTED, sm.SETTLED):
+            raise HTTPException(409, "验收结束后才能预览交付")
+        try:
+            return delivery.preview(store)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
 
     @app.get("/api/quests/{quest_id}/diff")
     async def quest_diff(quest_id: str) -> dict[str, Any]:

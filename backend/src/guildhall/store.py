@@ -12,6 +12,8 @@ from . import layout, statemachine as sm
 from .questmd import acceptance_gate_error
 
 # ±08:00 之外的时区无所谓,demo 单机。用本地时区,与 quest id 的时间戳一致。
+_EVENT_COUNTS: dict[Path, tuple[int, int]] = {}
+
 _TZ = datetime.now().astimezone().tzinfo or timezone(timedelta(hours=8))
 
 
@@ -165,9 +167,14 @@ class QuestStore:
         """旁路事件流:一角色一个 jsonl,每行一个原始 envelope。返回行号(0 基)。"""
         path = self.events_dir / f"{role}.jsonl"
         with self._lock:
+            size = path.stat().st_size if path.exists() else 0
+            cached_size, count = _EVENT_COUNTS.get(path, (-1, 0))
+            if cached_size != size:
+                count = _line_count(path) if path.exists() else 0
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(envelope, ensure_ascii=False) + "\n")
-            return _line_count(path) - 1
+            _EVENT_COUNTS[path] = (path.stat().st_size, count + 1)
+            return count
 
     def read_events(self, role: str, offset: int = 0) -> list[dict[str, Any]]:
         path = self.events_dir / f"{role}.jsonl"

@@ -5,6 +5,12 @@
 
 from __future__ import annotations
 
+from typing import Literal, Annotated
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from .questmd import acceptance_steps, scope_patterns, in_scope
+
+
+
 import asyncio
 import json
 import logging
@@ -16,6 +22,24 @@ from . import gitutil, prompts, statemachine as sm, store as st
 from .questmd import negative_step_violation
 from .runtime import QuestRuntime, RoleRuntime
 from .sandbox import SandboxManager
+
+Nonempty = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+class AppraisalCheck(BaseModel):
+    model_config = ConfigDict(strict=True)
+    index: int = Field(ge=1)
+    step: Nonempty
+    result: Literal["pass", "fail"]
+    evidence: Nonempty
+    unsatisfiable: bool = False
+
+class AppraisalResult(BaseModel):
+    model_config = ConfigDict(strict=True)
+    checks: list[AppraisalCheck] = Field(min_length=1)
+    touched_tests: bool
+    out_of_scope_files: list[Nonempty]
+    summary: Nonempty
+
 
 log = logging.getLogger("guildhall.flow")
 RECEPTIONIST_GENERATION_IDLE_TIMEOUT = 30.0
@@ -51,7 +75,7 @@ async def open_receptionist(rt: QuestRuntime) -> RoleRuntime:
         try:
             before = gitutil.diff_head_sha256(store.project)
             state = store.update_state(
-                integrity={**state["integrity"], "receptionist": {"before": before, "after": None, "ok": None}}
+                integrity={**state["integrity"], "receptionist": {"before": before, "after": None, "ok": None, "snapshot": gitutil.tracked_snapshot(Path(store.project))}}
             )
         except RuntimeError as e:
             store.set_error(f"无法建立完整性基线:{e}")
@@ -304,7 +328,7 @@ def finalize_receptionist_integrity(store: st.QuestStore) -> None:
     except RuntimeError as e:
         store.set_error(f"receptionist 进出一致校验失败:{e}")
         return
-    ok = entry["before"] == after
+    ok = entry["before"] == after and (not entry.get("snapshot") or entry["snapshot"] == gitutil.tracked_snapshot(Path(store.project)))
     state = store.update_state(
         integrity={**state["integrity"], "receptionist": {**entry, "after": after, "ok": ok}}
     )
@@ -337,7 +361,7 @@ async def dispatch_adventurer(
             base = state.get("base_commit") or gitutil.head_commit(worktree)
         else:
             base = gitutil.create_worktree(repo, store.quest_id, worktree, branch)
-        state = store.update_state(base_commit=base)
+        state = store.update_state(base_commit=base, target_branch=gitutil._run(["symbolic-ref", "--short", "HEAD"], cwd=repo).stdout.strip())
     except Exception as e:  # noqa: BLE001
         store.set_error(f"adventurer worktree 准备失败:{e}")
         _safe_transition(store, sm.FAILED)
@@ -363,17 +387,21 @@ async def dispatch_adventurer(
     async def run() -> None:
         try:
             await session.prompt(prompts.adventurer_first_message(quest_md), idle_timeout=120)
+            await session.close()
+            for path in gitutil.untracked_paths(worktree):
+                if in_scope(path, scope_patterns(quest_md)):
+                    gitutil._run(["add", "--", path], cwd=worktree)
             # adventurer session 结束事件 → in_progress → appraising(§2.5)
             _safe_transition(store, sm.APPRAISING)
             await run_appraisal(rt, manager)
         except Exception as e:  # noqa: BLE001
             log.exception("adventurer failed")
             store.set_error(f"adventurer 异常:{e}")
-            _safe_transition(store, sm.FAILED)
+            _safe_transition(store, sm.DISPUTED if store.read_state()["state"] == sm.APPRAISING else sm.FAILED)
+        finally:
+            await session.close()
 
-    task = asyncio.create_task(run())
-    rt.tasks.add(task)
-    task.add_done_callback(rt.tasks.discard)
+    await run()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -386,8 +414,12 @@ async def run_appraisal(rt: QuestRuntime, manager: SandboxManager) -> None:
     state = store.read_state()
     worktree = Path(state["worktree"])
 
+    store.update_state(review_snapshot=None, review_quest=None)
+    store.appraisal_json.unlink(missing_ok=True)
     # 进出一致基线:appraiser 开始前的 tracked 状态(adventurer 刚改完的样子)
     try:
+        snapshot_before = gitutil.tracked_snapshot(worktree)
+        untracked_before = gitutil.untracked_paths(worktree)
         before = gitutil.diff_head_sha256(worktree)
         state = store.update_state(
             integrity={**state["integrity"], "appraiser": {"before": before, "after": None, "ok": None}}
@@ -400,14 +432,18 @@ async def run_appraisal(rt: QuestRuntime, manager: SandboxManager) -> None:
     quest_md = store.read_quest_md() or ""
     session_name = f"guildhall-{store.quest_id}-appraiser"
     session = manager.open_session(session_name, role="appraiser")
-    await session.start()
-    await session.new_session(cwd=str(worktree))
+    try:
+        await session.start()
+        await session.new_session(cwd=str(worktree))
+    except Exception:
+        await session.close()
+        raise
     state = store.read_state()
     store.update_state(sessions={**state["sessions"], "appraiser": session_name})
     rt.roles["appraiser"] = RoleRuntime(store, "appraiser", session)
 
     try:
-        await session.prompt(prompts.appraiser_first_message(quest_md), idle_timeout=120)
+        await session.prompt(prompts.appraiser_first_message(quest_md) + "\nchecks 必须从 1 连续编号，完整覆盖所有步骤；step 逐字复制验收步骤原文（不含编号），不得缩写。\n<git-diff>\n" + gitutil.diff_vs_base(worktree, state["base_commit"]) + "\n</git-diff>", idle_timeout=120)
     except Exception as e:  # noqa: BLE001
         store.set_error(f"appraiser 异常:{e}")
         await session.close()
@@ -422,7 +458,7 @@ async def run_appraisal(rt: QuestRuntime, manager: SandboxManager) -> None:
         store.set_error(f"appraiser 进出一致校验失败:{e}")
         _safe_transition(store, sm.DISPUTED)
         return
-    integrity_ok = before == after
+    integrity_ok = before == after and snapshot_before == gitutil.tracked_snapshot(worktree)
     # §6.2:sha256 存进 state.json(after/ok 落盘,receptionist 同理)
     state = store.read_state()
     store.update_state(
@@ -433,16 +469,20 @@ async def run_appraisal(rt: QuestRuntime, manager: SandboxManager) -> None:
     appraisal: Optional[dict[str, Any]] = None
     parse_error: Optional[str] = None
     if raw:
-        appraisal = parse_appraisal(raw)
+        appraisal = parse_appraisal(raw, quest_md)
         if appraisal is None:
             parse_error = "appraisal 输出不是合法 JSON(§6.4:不重试,原始输出见 error)"
 
     if appraisal is not None:
         appraisal["invalidated"] = not integrity_ok
+        store.update_state(review_snapshot=gitutil.tracked_snapshot(worktree), review_quest=quest_md)
         if integrity_ok:
             # 确定性防线(§2.6):服务端直接从 diff 抓偷改测试,不依赖 appraiser 的自觉。
             # 真模型的判断是 e2e 的职责,这里只做机械兜底。
             diff_text = gitutil.diff_vs_base(worktree, state.get("base_commit"))
+            paths = gitutil.changed_paths(worktree, state["base_commit"]) + untracked_before
+            appraisal["out_of_scope_files"] = sorted(set(appraisal["out_of_scope_files"]) | {p for p in paths if not in_scope(p, scope_patterns(quest_md))})
+            store.update_state(review_snapshot=gitutil.tracked_snapshot(worktree), review_quest=quest_md)
             if detect_touched_tests(diff_text):
                 appraisal["touched_tests"] = True
         store.write_appraisal(appraisal)
@@ -450,7 +490,7 @@ async def run_appraisal(rt: QuestRuntime, manager: SandboxManager) -> None:
 
         if not integrity_ok:
             _safe_transition(store, sm.DISPUTED)
-        elif appraisal.get("touched_tests") or appraisal.get("out_of_scope_files") or any(
+        elif appraisal.get("out_of_scope_files") or any(
             c.get("result") != "pass" for c in appraisal.get("checks", [])
         ):
             _safe_transition(store, sm.DISPUTED)
@@ -458,11 +498,11 @@ async def run_appraisal(rt: QuestRuntime, manager: SandboxManager) -> None:
             _safe_transition(store, sm.APPRAISED)
     else:
         # §6.4 第 7 条:解析失败 → disputed + error 存原始输出,不重试
-        store.set_error(f"appraisal.json 解析失败:{parse_error}\n原始输出:\n{raw[:4000]}")
+        store.set_error(f"appraisal.json 解析失败:{parse_error}\n原始输出:\n{raw}")
         _safe_transition(store, sm.DISPUTED)
 
 
-def parse_appraisal(raw: str) -> Optional[dict[str, Any]]:
+def parse_appraisal(raw: str, quest_md: str | None = None) -> Optional[dict[str, Any]]:
     text = raw.strip()
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if m:
@@ -477,9 +517,20 @@ def parse_appraisal(raw: str) -> Optional[dict[str, Any]]:
         data = json.loads(text)
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, dict) or "checks" not in data:
+    try:
+        result = AppraisalResult.model_validate(data).model_dump()
+    except ValidationError:
         return None
-    return data
+    checks = result["checks"]
+    if [c["index"] for c in checks] != list(range(1, len(checks) + 1)):
+        return None
+    if any(c["unsatisfiable"] and c["result"] == "pass" for c in checks):
+        return None
+    if quest_md is not None:
+        steps = [re.sub(r"^\d+\.\s*", "", s) for s in acceptance_steps(quest_md)]
+        if [c["step"] for c in checks] != steps:
+            return None
+    return result
 
 
 # 改了这些路径 = 改了测试/断言/CI(§2.6 确定性检测的判定面)
@@ -513,7 +564,7 @@ def detect_touched_tests(diff: str) -> bool:
                 path = path[2:]
             if path and path != "/dev/null":
                 touched_paths.add(path)
-    return any(_TEST_PATH_RE.search(p) or _CI_PATH_RE.search(p) for p in touched_paths)
+    return any(_TEST_PATH_RE.search(p.lower()) or _CI_PATH_RE.search(p) for p in touched_paths)
 
 
 def _safe_transition(store: st.QuestStore, to: str) -> None:

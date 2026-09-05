@@ -214,6 +214,24 @@ class QuestRuntime:
         self.tasks: set[asyncio.Task] = set()
         self.generation_task: Optional[asyncio.Task] = None
         self.closing = False
+        self.phase_task: Optional[asyncio.Task] = None
+
+    def phase_busy(self) -> bool:
+        return self.phase_task is not None and not self.phase_task.done()
+
+    def start_phase(self, factory) -> None:
+        if self.phase_busy():
+            raise RuntimeError("当前阶段仍在运行，请等待结束后再恢复")
+        async def run():
+            try:
+                await factory()
+            except Exception as exc:
+                self.store.set_error(f"阶段启动或执行失败:{exc}")
+                state = self.store.read_state()["state"]
+                if state in ("in_progress", "appraising"):
+                    self.store.transition("failed" if state == "in_progress" else "disputed")
+        self.phase_task = asyncio.create_task(run(), name=f"phase:{self.store.quest_id}")
+        self.track(self.phase_task)
 
     # ---------- 角色会话 ----------
 
@@ -276,6 +294,11 @@ class QuestRuntime:
 
     async def close_all(self) -> None:
         self.closing = True
+        tasks = [t for t in self.tasks if t is not asyncio.current_task() and not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for rt in self.roles.values():
             await rt.close()
         self.roles.clear()
