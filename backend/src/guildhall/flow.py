@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from . import gitutil, prompts, statemachine as sm, store as st
+from . import gitutil, prompts, questmd, statemachine as sm, store as st
 from .questmd import negative_step_violation
 from .runtime import QuestRuntime, RoleRuntime
 from .sandbox import SandboxManager
@@ -43,6 +43,8 @@ class AppraisalResult(BaseModel):
 
 log = logging.getLogger("guildhall.flow")
 RECEPTIONIST_GENERATION_IDLE_TIMEOUT = 30.0
+# quest.md 校验失败时自动回喂 receptionist 的连续上限:超过后只报错给人,不再拉扯。
+QUEST_MD_FEEDBACK_CAP = 2
 
 
 def is_generation_request(text: str) -> bool:
@@ -80,7 +82,83 @@ async def open_receptionist(rt: QuestRuntime) -> RoleRuntime:
         except RuntimeError as e:
             store.set_error(f"无法建立完整性基线:{e}")
 
-    return await rt.open_role("receptionist", cwd=store.project)
+    receiver = await rt.open_role("receptionist", cwd=store.project)
+    receiver.on_turn_end = _make_receptionist_turn_end(rt)
+    return receiver
+
+
+def _make_receptionist_turn_end(rt: QuestRuntime):
+    """receptionist 每个 chat turn 结束后,reconcile 它直接写盘的 quest.md。
+
+    generation turn 不走这里——generate_quest 自己收口(发 generation_end)。
+    """
+
+    def on_turn_end(turn_id: str, kind: str, before_quest_md: Optional[str]) -> None:
+        if kind != "chat":
+            return
+        task = asyncio.create_task(
+            reconcile_quest_md(rt, before_quest_md),
+            name=f"reconcile:{rt.store.quest_id}",
+        )
+        rt.track(task)
+
+    return on_turn_end
+
+
+async def reconcile_quest_md(rt: QuestRuntime, before: Optional[str]) -> None:
+    """Agent 在普通对话轮里直接写了 quest.md:修正事实字段 → 闸门校验 → 回执事件。
+
+    - 通过:落盘规范化版本,清 error,发 _guildhall/quest_md_updated。
+    - 失败:发 _guildhall/quest_md_rejected,并把原因作为系统消息自动喂回
+      receptionist 让它修文件(连续上限 QUEST_MD_FEEDBACK_CAP,防死循环)。
+    - 本轮没动文件(before == after)则什么都不做;张贴闸门(check_postable)
+      仍是最终兜底,这里的校验只是把失败尽早暴露。
+    """
+    store = rt.store
+    try:
+        if store.read_state()["state"] != sm.DRAFTING:
+            return
+        after = store.read_quest_md()
+    except Exception:  # noqa: BLE001
+        log.exception("reconcile_quest_md: 读取状态失败 quest=%s", store.quest_id)
+        return
+    if after is None or after == before:
+        return
+    md = questmd.normalize_frontmatter(
+        after, quest_id=store.quest_id, project=store.project, created=st.now_iso()
+    )
+    receiver = rt.get_role("receptionist")
+    gate = st.acceptance_gate_error(md)
+    if gate:
+        store.set_error(f"quest.md 校验未通过:{gate}")
+        if receiver is not None:
+            receiver.publish_synthetic({"method": "_guildhall/quest_md_rejected", "params": {"reason": gate}})
+        if rt.quest_md_feedback_streak >= QUEST_MD_FEEDBACK_CAP:
+            log.warning(
+                "quest.md 连续 %d 次校验失败,停止自动回喂(quest=%s)",
+                rt.quest_md_feedback_streak, store.quest_id,
+            )
+            return
+        if receiver is None:
+            return
+        rt.quest_md_feedback_streak += 1
+        try:
+            _, task = await receiver.submit_user(
+                "【系统转达】quest.md 未通过张贴闸门校验:"
+                f"{gate} 请直接修正 {store.quest_md}(先 Read 再 Edit),不要在对话里复述全文。",
+                system=True,
+            )
+            if task is not None:
+                rt.track(task)
+        except Exception as e:  # noqa: BLE001
+            log.warning("quest.md 校验失败原因无法回传 receptionist: %s", e)
+        return
+    if md != after:
+        store.write_quest_md(md)
+    store.set_error(None)
+    rt.quest_md_feedback_streak = 0
+    if receiver is not None:
+        receiver.publish_synthetic({"method": "_guildhall/quest_md_updated", "params": {}})
 
 
 async def start_receptionist(rt: QuestRuntime, opening_message: Optional[str]) -> None:
@@ -107,7 +185,8 @@ async def continue_chat(rt: QuestRuntime, text: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 生成需求单:receptionist 吐 markdown → 服务端规范化 frontmatter → 校验闸门
+# 生成需求单:receptionist 直接写盘 quest.md(新契约) → 服务端修正事实字段 →
+# 校验闸门;旧模型在对话里吐全文时仍按文本截获兜底。
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -117,7 +196,7 @@ async def generate_quest(
     prompt_override: Optional[str] = None,
     visible_user_text: Optional[str] = None,
 ) -> dict[str, Any]:
-    """触发 receptionist 输出需求单,落盘 quest.md。写不出可执行验收则拒绝。"""
+    """触发 receptionist 产出并落盘 quest.md。写不出可执行验收则拒绝。"""
     store = rt.store
     if store.read_state()["state"] != sm.DRAFTING:
         return {"ok": False, "reason": "只有 drafting 状态能生成需求单"}
@@ -129,6 +208,7 @@ async def generate_quest(
     if receiver.status()["busy"]:
         return {"ok": False, "reason": "前台 Agent 仍在工作，请等当前 turn 结束后再生成需求单"}
 
+    before = store.read_quest_md()
     receiver.publish_synthetic({"method": "_guildhall/generation_start", "params": {}})
     try:
         # 生成是单发结构化 turn：文本已经完整、但 adapter 丢失 stopReason 时，
@@ -144,6 +224,26 @@ async def generate_quest(
         store.set_error(reason)
         receiver.publish_synthetic({"method": "_guildhall/generation_end", "params": {"ok": False, "reason": reason}})
         return {"ok": False, "reason": reason}
+
+    # 新契约优先:receptionist 在 turn 里直接把需求单写进了 quest.md
+    after = store.read_quest_md()
+    if after is not None and after != before:
+        md = questmd.normalize_frontmatter(
+            after, quest_id=store.quest_id, project=store.project, created=st.now_iso()
+        )
+        gate = st.acceptance_gate_error(md)
+        if gate:
+            result = {"ok": False, "reason": gate, "raw": md}
+            store.set_error(gate)
+            receiver.publish_synthetic({"method": "_guildhall/generation_end", "params": {"ok": False, "reason": gate}})
+            return result
+        if md != after:
+            store.write_quest_md(md)
+        store.set_error(None)
+        receiver.publish_synthetic({"method": "_guildhall/generation_end", "params": {"ok": True}})
+        return {"ok": True, "quest_md": md}
+
+    # 兜底:模型没写文件、仍把全文吐在对话里 → 从 turn 文本截获(旧路径)
     if not raw:
         reason = "receptionist 没有输出任何内容"
         receiver.publish_synthetic({"method": "_guildhall/generation_end", "params": {"ok": False, "reason": reason}})

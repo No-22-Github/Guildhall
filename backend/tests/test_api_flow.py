@@ -365,6 +365,152 @@ def test_generation_request_detection_does_not_capture_discussion_sentences():
     assert not is_generation_request("我们讨论一下需求单如何生成")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 新契约:receptionist 用写文件工具直接交付 quest.md(docs/reliability.md)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_receptionist_writes_quest_md_file_during_chat_turn(client, wired, demo_repo):
+    """Agent 在普通对话轮里直接写盘 quest.md → 服务端修正事实字段并发回执事件。"""
+    from guildhall import store as store_module
+
+    holder = {}
+
+    async def receptionist_script(text: str):
+        if "需求拷问者" in text:
+            return ([chunk("先问几个问题")], "先问几个问题", "end_turn")
+        path = holder.get("quest_md_path")
+        if path is not None and "写单" in text:
+            path.write_text(QUEST_MD_TEMPLATE.format(qid="PLACEHOLDER", project="PLACEHOLDER"), encoding="utf-8")
+            return ([chunk("需求单已写入文件")], "需求单已写入文件", "end_turn")
+        return ([chunk("收到")], "收到", "end_turn")
+
+    wired.set_script("receptionist", receptionist_script)
+    client.post("/api/projects", json={"path": str(demo_repo)})
+    r = client.post("/api/quests", json={"project": str(demo_repo), "message": "聊聊需求"})
+    qid = r.json()["id"]
+    quest = store_module.find_quest(qid)
+    assert quest is not None
+    holder["quest_md_path"] = quest.quest_md
+
+    r = client.post(f"/api/quests/{qid}/message", json={"text": "可以了，写单吧"})
+    assert r.status_code == 200
+
+    deadline = time.time() + 5
+    body = None
+    while time.time() < deadline:
+        body = client.get(f"/api/quests/{qid}").json()
+        if body["quest_md"]:
+            break
+        time.sleep(0.05)
+    assert body is not None and body["quest_md"] is not None
+    assert f"id: {qid}" in body["quest_md"]  # 事实字段以服务端为准,PLACEHOLDER 被修正
+    assert f"project: {demo_repo}" in body["quest_md"]
+    assert "PLACEHOLDER" not in body["quest_md"]
+    assert body["state"]["error"] is None
+    methods = [e.get("method") for e in quest.read_events("receptionist")]
+    assert "_guildhall/quest_md_updated" in methods
+
+    # 面板出现即可张贴(闸门已在 reconcile 时通过)
+    r = client.post(f"/api/quests/{qid}/transition", json={"to": "posted"})
+    assert r.status_code == 200, r.text
+
+
+def test_quest_md_file_rejection_feeds_reason_back_to_receptionist(client, wired, demo_repo):
+    """Agent 写盘的 quest.md 过不了闸门 → 回执失败事件 + 原因自动回喂,连续上限 2 次。"""
+    from guildhall import store as store_module
+
+    holder = {"version": 0}
+
+    async def receptionist_script(text: str):
+        if "需求拷问者" in text:
+            return ([chunk("先问几个问题")], "先问几个问题", "end_turn")
+        path = holder.get("quest_md_path")
+        if path is not None and ("写单" in text or "系统转达" in text):
+            # 每次都写一版「缺负向测试」的新内容,模拟屡教不改
+            holder["version"] += 1
+            bad = QUEST_MD_TEMPLATE.format(qid="PLACEHOLDER", project="PLACEHOLDER")
+            bad = bad.replace("2. 【负向】把 main() 的返回值改错一位,测试必须失败\n", "")
+            path.write_text(bad + f"\n<!-- v{holder['version']} -->\n", encoding="utf-8")
+            return ([chunk("已写入")], "已写入", "end_turn")
+        return ([chunk("收到")], "收到", "end_turn")
+
+    wired.set_script("receptionist", receptionist_script)
+    client.post("/api/projects", json={"path": str(demo_repo)})
+    r = client.post("/api/quests", json={"project": str(demo_repo), "message": "聊聊需求"})
+    qid = r.json()["id"]
+    quest = store_module.find_quest(qid)
+    holder["quest_md_path"] = quest.quest_md
+
+    r = client.post(f"/api/quests/{qid}/message", json={"text": "可以了，写单吧"})
+    assert r.status_code == 200
+
+    # 初次拒绝 + 两次回喂各触发一轮;每次 Agent 重写坏文件再被拒,上限后停止
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        feeds = [t for _, t in wired.prompts if "系统转达" in t]
+        if len(feeds) >= 2:
+            break
+        time.sleep(0.05)
+    feeds = [t for _, t in wired.prompts if "系统转达" in t]
+    assert len(feeds) == 2, f"expected 2 auto-feeds, got {len(feeds)}"
+
+    # 回喂内容带上了闸门原因与文件绝对路径
+    assert "负向" in feeds[0]
+    assert str(quest.quest_md) in feeds[0]
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        methods = [e.get("method") for e in quest.read_events("receptionist")]
+        if methods.count("_guildhall/quest_md_rejected") >= 3:
+            break
+        time.sleep(0.05)
+    methods = [e.get("method") for e in quest.read_events("receptionist")]
+    assert methods.count("_guildhall/quest_md_rejected") == 3  # 3 次拒绝,只有前 2 次回喂
+    assert "_guildhall/quest_md_updated" not in methods
+    state = client.get(f"/api/quests/{qid}").json()["state"]
+    assert "负向" in state["error"]
+
+    # 坏单不许张贴(最终闸门兜底)
+    r = client.post(f"/api/quests/{qid}/transition", json={"to": "posted"})
+    assert r.status_code == 409
+
+
+def test_generate_button_uses_agent_written_file(client, wired, demo_repo):
+    """「生成需求单」按钮:Agent 直接写盘时以文件为准,turn 文本只作兜底。"""
+    from guildhall import store as store_module
+
+    holder = {}
+
+    async def receptionist_script(text: str):
+        if "需求拷问者" in text:
+            return ([chunk("先问几个问题")], "先问几个问题", "end_turn")
+        if text.strip() == "生成需求单":
+            path = holder.get("quest_md_path")
+            if path is not None:
+                path.write_text(QUEST_MD_TEMPLATE.format(qid="PLACEHOLDER", project="PLACEHOLDER"), encoding="utf-8")
+                return ([chunk("需求单已写入文件，请在右侧查看。")], "需求单已写入文件，请在右侧查看。", "end_turn")
+        return ([chunk("收到")], "收到", "end_turn")
+
+    wired.set_script("receptionist", receptionist_script)
+    client.post("/api/projects", json={"path": str(demo_repo)})
+    r = client.post("/api/quests", json={"project": str(demo_repo), "message": "聊聊需求"})
+    qid = r.json()["id"]
+    quest = store_module.find_quest(qid)
+    holder["quest_md_path"] = quest.quest_md
+    _wait_receptionist_idle(client, qid)
+
+    md = _generate(client, qid)
+    assert md is not None
+    assert "## 验收步骤" in md
+    assert f"id: {qid}" in md  # 文件路径也要过事实字段修正
+    assert "PLACEHOLDER" not in md
+    methods = [e.get("method") for e in quest.read_events("receptionist")]
+    assert "_guildhall/generation_start" in methods
+    assert "_guildhall/generation_end" in methods
+    assert client.get(f"/api/quests/{qid}").json()["state"]["error"] is None
+
+
 def test_full_pipeline_to_settled(client, wired, demo_repo, tmp_guildhall):
     # 注册项目
     r = client.post("/api/projects", json={"path": str(demo_repo)})

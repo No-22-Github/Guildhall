@@ -9,6 +9,7 @@ import AgentStatusPanel, { displayToolName, ACTIVITY_LABEL } from '../components
 interface UserItem {
   kind: 'user'
   text: string
+  system?: boolean
 }
 
 interface AgentItem {
@@ -71,10 +72,20 @@ function buildTimeline(events: { seq: number; env: any }[]): TimelineItem[] {
 
   for (const { env } of events) {
     if (env.method === '_guildhall/user_message') {
-      items.push({ kind: 'user', text: env.params?.text ?? '' })
+      items.push({ kind: 'user', text: env.params?.text ?? '', system: Boolean(env.params?.system) })
       currentAgent = null
       agentSpoke = false
       dividerBeforeNextAgent = false
+      continue
+    }
+    if (env.method === '_guildhall/quest_md_updated') {
+      currentAgent = null
+      items.push({ kind: 'action', text: '需求单已写入 quest.md（右侧可查看、修改并张贴）', status: 'success' })
+      continue
+    }
+    if (env.method === '_guildhall/quest_md_rejected') {
+      currentAgent = null
+      items.push({ kind: 'action', text: `需求单校验未通过：${env.params?.reason ?? '未知原因'}`, status: 'error' })
       continue
     }
     if (env.method === '_guildhall/generation_start') {
@@ -410,8 +421,8 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
                 }
                 return (
                   <div key={`${item.kind}-${index}`} className={`flex ${item.kind === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`chat-message ${item.kind === 'user' ? 'user-message whitespace-pre-wrap bg-blue-600 text-white' : 'agent-message text-gray-900'}`}>
-                      {item.kind === 'agent' ? <MarkdownMessage text={item.text} /> : item.text}
+                    <div className={`chat-message ${item.kind === 'user' ? (item.system ? 'whitespace-pre-wrap border border-amber-200 bg-amber-50 text-amber-800' : 'user-message whitespace-pre-wrap bg-blue-600 text-white') : 'agent-message text-gray-900'}`}>
+                      {item.kind === 'agent' ? <MarkdownMessage text={item.text} /> : item.system ? <><span className="mr-1 rounded bg-amber-100 px-1 text-[10px] font-medium">系统转达</span>{item.text}</> : item.text}
                     </div>
                   </div>
                 )

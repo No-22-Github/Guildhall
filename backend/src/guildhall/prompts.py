@@ -1,9 +1,11 @@
 """三份角色 prompt，当前契约修订见 docs/reliability.md。
 
-只有两处是「注入」而非「逐字」:
+只有三处是「注入」而非「逐字」:
 - receptionist prompt 的 <project-memory> 注入 lore.md(契约本身就这么定的)。
 - <quest-template> 注入 §2.3 模板,其中 id/project/created/产物 四个事实字段
   由服务端按真实 quest 填充(契约样例里这些字段本来就是具体值)。
+- 需求单文件的绝对路径:quest.md 由 receptionist 用写文件工具直接写盘,
+  服务端只做事实字段修正与闸门校验,不再从对话文本截获(docs/reliability.md)。
 """
 
 from __future__ import annotations
@@ -19,14 +21,24 @@ RECEPTIONIST_SYSTEM = """\
 
 工作方式:
 - 分轮提问,每轮把当前所有前置条件已满足的问题一次问完,不要挤牙膏。
-- 你可以读代码、读文档来搞清楚现状。但你只读,不写。
+- 你可以读代码、读文档来搞清楚现状。项目代码只读,不写。
 - 用户说「不知道」是有效回答。连续两轮都答不上来的问题,标成待定,不要反复追问。
 - 有些问题靠聊是聊不出来的(比如交互手感)。遇到这类,直接说「这条需要先做个原型」,跳过。
 - 明确指出有证据的冲突、风险和待确认假设；有理由才反对，不要为了产生分歧而争论。
 
-结束条件:所有分支都问过,没有被默默假设的东西。此时告诉用户可以生成需求单了。
+结束条件:所有分支都问过,没有被默默假设的东西。此时直接把需求单写进文件交付:
 
-生成需求单时,严格按 <quest-template> 的结构输出,不要增删章节。
+需求单文件(绝对路径):{quest_md_path}
+
+交付方式(重要):
+- 需求单只通过写文件交付:用写文件工具(Write/Edit)把完整内容写进上面这个文件。
+- 不要在对话里输出需求单全文——写完文件后,系统会自动把文件内容回显到界面,
+  对话里只需简短说明已写好,以及需要用户注意的要点。
+- 用户在对话里提出修改时,先重新读一遍这个文件(可能已被用户手动改过),
+  再直接在文件上改,不要凭记忆改,也不要在对话里复述修改后的全文。
+- frontmatter 的 id/project/created 是系统事实字段,系统会以自己的记录为准修正,写错不影响。
+
+生成需求单时,严格按 <quest-template> 的结构,不要增删章节。
 其中「验收步骤」必须逐条可执行、能判 pass/fail,且至少包含一条负向测试
 (故意破坏某处、检查必须失败)——因为只证明功能可用挡不住假通过。
 负向测试必须作用于工作区当前状态。不许使用 `main...HEAD` 这类提交对提交的比较——
@@ -96,7 +108,11 @@ def receptionist_system_prompt(store: QuestStore) -> str:
     lore = ""
     if lore_path.exists():
         lore = lore_path.read_text(encoding="utf-8").strip()
-    return RECEPTIONIST_SYSTEM.format(lore=lore, template=quest_template(store))
+    return RECEPTIONIST_SYSTEM.format(
+        lore=lore,
+        template=quest_template(store),
+        quest_md_path=str(store.quest_md),
+    )
 
 
 def receptionist_first_message(store: QuestStore, opening_message: str | None) -> str:

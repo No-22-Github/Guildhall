@@ -40,6 +40,37 @@ def parse(text: str) -> QuestDoc:
     return QuestDoc(frontmatter={}, body=text.strip())
 
 
+_ISO_LIKE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
+
+
+def normalize_frontmatter(text: str, *, quest_id: str, project: str, created: str) -> str:
+    """receptionist 直接写盘的 quest.md 的规范化:程序事实字段(id/project/created)
+    以服务端为准重建,超出四键的 frontmatter 一律丢弃;title 保留 Agent 写的,
+    缺失时回退正文一级标题,再退 quest_id。正文原样保留。
+
+    created 参数由调用方传入 now_iso()(本模块不许反向依赖 store,避免循环导入)。
+    """
+    doc = parse(text)
+    title = doc.frontmatter.get("title", "").strip()
+    if not title:
+        h1 = re.search(r"^#\s+(.+)$", doc.body, re.MULTILINE)
+        if h1:
+            title = h1.group(1).strip()
+    fm_created = doc.frontmatter.get("created", "").strip()
+    if not _ISO_LIKE_RE.match(fm_created):
+        fm_created = created
+    fixed = QuestDoc(
+        frontmatter={
+            "id": quest_id,
+            "title": title or quest_id,
+            "project": project,
+            "created": fm_created,
+        },
+        body=doc.body,
+    )
+    return fixed.render()
+
+
 def acceptance_steps(body: str) -> list[str]:
     """取出「## 验收步骤」一节里的逐条条目(编号行)。"""
     m = re.search(r"^## 验收步骤\s*$(.*?)(?=^## |\Z)", body, re.MULTILINE | re.DOTALL)

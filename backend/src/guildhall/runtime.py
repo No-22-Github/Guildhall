@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import store as st
 from .acp import AcpError, AcpSession, SessionDied
@@ -39,6 +39,9 @@ class RoleRuntime:
         self.session = session
         self.subscribers: set[asyncio.Queue] = set()
         session.on_update = self._on_envelope
+        # turn 结束回调:(turn_id, kind, turn 开始时的 quest.md 快照)。
+        # flow 层用来 reconcile「Agent 在对话轮里直接写盘的 quest.md」。
+        self.on_turn_end: Optional[Callable[[str, str, Optional[str]], None]] = None
         self.died: Optional[str] = None
         self.active_turns = 0
         self.activity = "waiting"
@@ -136,6 +139,10 @@ class RoleRuntime:
         )
 
         async def run() -> str:
+            try:
+                before_quest_md = self.store.read_quest_md()
+            except Exception:  # noqa: BLE001
+                before_quest_md = None
             stop_reason = "end_turn"
             try:
                 stop_reason = await self.session.prompt(prompt_text, idle_timeout=idle_timeout)
@@ -161,15 +168,25 @@ class RoleRuntime:
                     }
                 )
                 self.flush_offset()
+                if self.on_turn_end is not None:
+                    try:
+                        self.on_turn_end(turn_id, kind, before_quest_md)
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_turn_end callback failed for %s/%s", self.store.quest_id, self.role)
 
         return asyncio.create_task(run(), name=f"{kind}:{self.store.quest_id}:{turn_id[:8]}")
 
-    async def submit_user(self, text: str) -> tuple[str, Optional[asyncio.Task[str]]]:
-        """优先插入当前 Claude turn；空闲时再启动一个普通 turn。"""
+    async def submit_user(self, text: str, *, system: bool = False) -> tuple[str, Optional[asyncio.Task[str]]]:
+        """优先插入当前 Claude turn；空闲时再启动一个普通 turn。
+
+        system=True 标记服务端转达的消息(如 quest.md 校验失败原因):事件流里
+        带 system 字段,前端按「系统转达」样式渲染,不冒充用户原话。
+        """
         turn_id = uuid.uuid4().hex
-        self.publish_synthetic(
-            {"method": "_guildhall/user_message", "params": {"text": text, "turnId": turn_id}}
-        )
+        params: dict[str, Any] = {"text": text, "turnId": turn_id}
+        if system:
+            params["system"] = True
+        self.publish_synthetic({"method": "_guildhall/user_message", "params": params})
         outcome = await self.session.steer(text)
         if outcome == "promptRequired":
             return outcome, self.begin_prompt(text, kind="chat")
@@ -215,6 +232,9 @@ class QuestRuntime:
         self.generation_task: Optional[asyncio.Task] = None
         self.closing = False
         self.phase_task: Optional[asyncio.Task] = None
+        # quest.md 校验失败连续自动回喂 receptionist 的次数(上限见 flow.QUEST_MD_FEEDBACK_CAP,
+        # 通过后清零;防止坏模型与服务端互相无限拉扯)。
+        self.quest_md_feedback_streak = 0
 
     def phase_busy(self) -> bool:
         return self.phase_task is not None and not self.phase_task.done()
