@@ -27,6 +27,11 @@ interface ToolItem {
   output?: string
 }
 
+interface ToolGroupItem {
+  kind: 'toolGroup'
+  tools: ToolItem[]
+}
+
 interface DividerItem {
   kind: 'divider'
 }
@@ -37,7 +42,7 @@ interface ActionItem {
   status: 'running' | 'success' | 'error'
 }
 
-type TimelineItem = UserItem | AgentItem | ToolItem | DividerItem | ActionItem
+type TimelineItem = UserItem | AgentItem | ToolGroupItem | DividerItem | ActionItem
 
 function contentText(value: unknown): string {
   if (typeof value === 'string') return value
@@ -54,7 +59,7 @@ function hasValues(value: unknown): boolean {
   return Boolean(value && typeof value === 'object' && Object.keys(value as Record<string, unknown>).length)
 }
 
-/** 将 ACP 事件恢复为“文本段 → 工具 → 分割线 → 后续文本段”，并保留工具参数与结果。 */
+/** 将 ACP 事件恢复为“文本段 → 工具组 → 分割线 → 后续文本段”；连续工具收进同一组以便折叠，并保留工具参数与结果。 */
 function buildTimeline(events: { seq: number; env: any }[]): TimelineItem[] {
   const items: TimelineItem[] = []
   const tools = new Map<string, ToolItem>()
@@ -128,7 +133,9 @@ function buildTimeline(events: { seq: number; env: any }[]): TimelineItem[] {
             status: update.status ?? 'pending',
           }
           tools.set(id, tool)
-          items.push(tool)
+          const last = items[items.length - 1]
+          if (last && last.kind === 'toolGroup') last.tools.push(tool)
+          else items.push({ kind: 'toolGroup', tools: [tool] })
         }
         const claude = update._meta?.claudeCode ?? {}
         if (claude.toolName) tool.name = claude.toolName
@@ -151,29 +158,64 @@ function buildTimeline(events: { seq: number; env: any }[]): TimelineItem[] {
   return items
 }
 
+function isToolTerminal(tool: ToolItem): boolean {
+  return tool.status === 'completed' || tool.status === 'failed' || tool.status === 'cancelled'
+}
+
 function ToolCard({ tool }: { tool: ToolItem }) {
-  const running = tool.status !== 'completed' && tool.status !== 'failed' && tool.status !== 'cancelled'
+  const running = !isToolTerminal(tool)
   const statusLabel = tool.status === 'completed' ? '完成' : tool.status === 'failed' ? '失败' : tool.status === 'cancelled' ? '已取消' : '运行中'
   const input = tool.input as Record<string, unknown> | undefined
   const command = typeof input?.command === 'string' ? input.command : null
   const file = typeof input?.file_path === 'string' ? input.file_path : typeof input?.path === 'string' ? input.path : null
+  const state = running ? 'is-running' : tool.status === 'failed' ? 'is-failed' : tool.status === 'cancelled' ? 'is-cancelled' : ''
   return (
     <div className="flex justify-start">
-      <details className="tool-card max-w-[88%]" open={running}>
+      <details className={`tool-card ${state}`} open={running}>
         <summary>
-          <span className={`tool-dot ${running ? 'animate-pulse bg-amber-500' : tool.status === 'failed' ? 'bg-red-500' : 'bg-emerald-500'}`} />
-          <span className="font-semibold">{displayToolName(tool.name)}</span>
-          <span className="min-w-0 flex-1 truncate text-gray-500">{tool.title}</span>
-          <span className="text-gray-400">{statusLabel}</span>
+          <span className="tool-dot" />
+          <span className="tool-name">{displayToolName(tool.name)}</span>
+          <span className="tool-title">{tool.title}</span>
+          <span className="tool-status">{statusLabel}</span>
         </summary>
-        <div className="space-y-2 border-t border-gray-200 p-3">
+        <div className="tool-body">
           {command && <ToolSection title="执行命令" text={command} />}
           {file && !command && <ToolSection title="文件" text={file} />}
           {input && !command && <ToolSection title="参数" text={JSON.stringify(input, null, 2)} />}
           {tool.output && <ToolSection title="输出" text={tool.output} />}
-          {!input && !tool.output && <p className="text-xs text-gray-400">等待 Claude Code 返回工具详情…</p>}
+          {!input && !tool.output && <p className="tool-waiting">等待 Claude Code 返回工具详情…</p>}
         </div>
       </details>
+    </div>
+  )
+}
+
+function ToolGroup({ group }: { group: ToolGroupItem }) {
+  const tools = group.tools
+  const firstRunning = tools.findIndex((tool) => !isToolTerminal(tool))
+  const failed = tools.filter((tool) => tool.status === 'failed').length
+  if (firstRunning === -1) {
+    return (
+      <div className="flex justify-start">
+        <details className={`tool-card tool-group ${failed ? 'is-failed' : ''}`}>
+          <summary>
+            <span className="tool-dot" />
+            <span className="tool-name">工具调用</span>
+            <span className="tool-title">共使用了 {tools.length} 个工具{failed > 0 && `，${failed} 个失败`}</span>
+            <small>详情</small>
+          </summary>
+          <div className="tool-body">
+            {tools.map((tool) => <ToolCard key={tool.toolId} tool={tool} />)}
+          </div>
+        </details>
+      </div>
+    )
+  }
+  const visible = tools.slice(Math.max(0, firstRunning - 1))
+  return (
+    <div className="tool-group-live">
+      <div className="tool-group-count">工具调用 · 已使用 {tools.length} 个</div>
+      {visible.map((tool) => <ToolCard key={tool.toolId} tool={tool} />)}
     </div>
   )
 }
@@ -181,8 +223,8 @@ function ToolCard({ tool }: { tool: ToolItem }) {
 function ToolSection({ title, text }: { title: string; text: string }) {
   return (
     <section>
-      <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-gray-400">{title}</div>
-      <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-gray-950 p-2 text-xs text-gray-100">{text}</pre>
+      <div className="tool-section-title">{title}</div>
+      <pre>{text}</pre>
     </section>
   )
 }
@@ -361,7 +403,7 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
           <div className="relative min-h-0 flex-1">
             <div ref={flowRef} className="chat-transcript h-full space-y-3 overflow-y-auto" onScroll={handleFlowScroll}>
               {timeline.map((item, index) => {
-                if (item.kind === 'tool') return <ToolCard key={`tool-${item.toolId}`} tool={item} />
+                if (item.kind === 'toolGroup') return <ToolGroup key={`tools-${item.tools[0].toolId}`} group={item} />
                 if (item.kind === 'divider') return <div key={`divider-${index}`} className="reply-divider"><span>工具执行后继续回复</span></div>
                 if (item.kind === 'action') {
                   return <div key={`action-${index}`} className={`rounded border px-3 py-2 text-xs ${item.status === 'error' ? 'border-red-200 bg-red-50 text-red-700' : item.status === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-blue-200 bg-blue-50 text-blue-700'}`}>{item.text}</div>
