@@ -50,26 +50,6 @@
 .brand-mark {
   font-size: 40px;
 }
-.project-select {
-  border-left: 1px solid #454033;
-  padding-left: 30px;
-  display: grid;
-  gap: 4px;
-  max-width: 30%;
-}
-.project-select > span {
-  font-size: 10px;
-  color: #9f9684;
-}
-.project-select select {
-  color: #e9dfcb;
-  background: transparent;
-  max-width: 100%;
-  font-size: 14px;
-}
-.project-select option {
-  background: #24231d;
-}
 .hall-counts {
   margin-left: auto;
   display: flex;
@@ -305,7 +285,7 @@
 }
 .station-shortcuts {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   margin-top: 23px;
   border: 1px solid #3c372c;
 }
@@ -358,9 +338,6 @@
 }
 .hall-footer > span:last-child {
   margin-left: auto;
-}
-.hall-footer button {
-  color: #c5b590;
 }
 .hall-dialog {
   padding: 0;
@@ -649,11 +626,6 @@
   margin-left: 14px;
   text-decoration: underline;
 }
-.workspace-dialog {
-  width: 96vw;
-  height: 92dvh;
-  max-height: 94dvh;
-}
 .workspace-dialog .dialog-body > div {
   height: 100%;
   background: var(--paper);
@@ -668,9 +640,6 @@
 }
 .workspace-dialog .bg-gray-50 {
   background: #f2eddf;
-}
-.workspace-dialog .bg-gray-100 {
-  background: #eae4d6;
 }
 .workspace-dialog .bg-blue-600 {
   background: #756044;
@@ -722,9 +691,6 @@
   .brand small {
     font-size: 8px;
     letter-spacing: 3px;
-  }
-  .project-select {
-    padding-left: 15px;
   }
   .hall-counts {
     display: none;
@@ -813,10 +779,6 @@
   .workspace-dialog .grid-cols-2 {
     grid-template-columns: 1fr;
   }
-  .workspace-dialog .w-\[42\%\] {
-    width: 45%;
-    min-width: 260px;
-  }
   .workspace-dialog header {
     gap: 8px;
     padding: 8px;
@@ -825,17 +787,10 @@
     font-size: 11px;
     padding: 6px;
   }
-  .workspace-dialog header > span.font-mono {
-    display: none;
-  }
 }
 @media (max-width: 500px) {
   .brand-mark {
     display: none;
-  }
-  .project-select {
-    max-width: 40%;
-    padding-left: 10px;
   }
   .settings-button {
     padding: 7px;
@@ -882,24 +837,6 @@
     grid-column: auto;
     grid-row: auto;
   }
-  .workspace-dialog .dialog-body > div > div.flex.min-h-0.flex-1 {
-    overflow: auto;
-    display: block;
-  }
-  .workspace-dialog .dialog-body > div > div.flex.min-h-0.flex-1 > div {
-    width: 100%;
-    min-width: 0;
-    min-height: 380px;
-    height: 60vh;
-  }
-  .workspace-dialog
-    .dialog-body
-    > div
-    > div.flex.min-h-0.flex-1
-    > div
-    > div.relative {
-    min-height: 150px;
-  }
 }
 .demo-banner {
   font-size: 11px;
@@ -908,3 +845,71 @@
   padding: 8px 12px;
   margin-bottom: 20px;
 }
+/* Project decisions live at each desk, not in global navigation. */
+.reception-project {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+.reception-project label {
+  flex: 1;
+  min-width: 0;
+}
+.reception-project button {
+  flex-shrink: 0;
+  color: #806235;
+  font-size: 12px;
+}
+.panel-content select {
+  width: 100%;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fffdf8;
+  color: var(--ink);
+  font-size: 13px;
+}
+.quest-project-context {
+  padding: 8px 22px;
+  background: #ede5d3;
+  color: #78664a;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  flex-shrink: 0;
+}
+.quest-card small {
+  overflow-wrap: anywhere;
+}
+@media (max-width: 500px) {
+  .reception-project {
+    display: block;
+  }
+}
+/* Reading workspace: use the desktop viewport instead of nesting a narrow chat. */
+.workspace-dialog { width:calc(100vw - 24px); max-width:calc(100vw - 24px); height:calc(100dvh - 24px); max-height:calc(100dvh - 24px); }
+.chat-toolbar { flex-shrink:0; min-height:54px; padding:8px 18px!important; }
+.chat-heading { display:flex; align-items:baseline; gap:14px; min-width:0; max-width:45%; }
+.chat-heading strong { font-size:14px; white-space:nowrap; }
+.chat-heading span { font-size:11px; color:#8b7a5e; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.chat-column { min-height:0; }
+.chat-runtime { flex-shrink:0; border-bottom:1px solid var(--line); background:#f0eadc; font-size:12px; color:#756952; }
+.chat-runtime summary { display:flex; align-items:center; gap:6px; padding:7px 20px; cursor:pointer; min-height:32px; }
+.chat-runtime summary small { margin-left:auto; white-space:nowrap; }
+.chat-runtime summary small::after { content:' ▾'; }
+.chat-runtime[open] summary small::after { content:' ▴'; }
+.chat-runtime>div { max-height:24vh; overflow:auto; padding:8px 20px; }
+.runtime-dot { width:6px; height:6px; border-radius:50%; background:#a7a69b; flex-shrink:0; }
+.runtime-dot.working { background:#6c8853; }
+.chat-transcript { padding:24px clamp(20px,4vw,64px); scroll-padding-block:24px; }
+.chat-transcript>div { max-width:1480px; margin-left:auto; margin-right:auto; }
+.chat-message { font-size:15px; line-height:1.8; min-width:0; overflow-wrap:anywhere; }
+.agent-message { width:100%; padding:0 0 18px; }
+.user-message { max-width:85%; padding:10px 16px; border-radius:6px; }
+.chat-composer { flex-shrink:0; padding:10px clamp(20px,4vw,64px); }
+.chat-composer>div { max-width:1480px; margin:auto; }
+.chat-composer textarea { min-height:56px; }
+.quest-document { width:42%; min-width:320px; border-left:1px solid var(--line); }
+.has-quest .chat-transcript,.has-quest .chat-composer { padding-left:22px; padding-right:22px; }
+@media(max-width:800px) { .chat-heading { flex-direction:column; gap:1px; max-width:55%; } .chat-toolbar { gap:7px; } .chat-transcript { padding:18px; } .chat-composer { padding:8px 18px; } .chat-message { font-size:14px; } }
+@media(max-width:500px) { .workspace-dialog { width:100vw; max-width:100vw; height:100dvh; max-height:100dvh; border-radius:0; } .workspace-dialog .chat-workspace .chat-columns { display:flex; flex-direction:column; overflow:auto; } .workspace-dialog .chat-workspace .chat-columns>.chat-column { width:100%; height:auto; min-height:0; flex:1; } .workspace-dialog .chat-workspace .chat-columns.has-quest>.chat-column { flex:none; height:60dvh; min-height:300px; } .workspace-dialog .chat-workspace .chat-columns>.quest-document { width:100%; min-width:0; flex:none; height:65dvh; } .chat-heading span { max-width:45vw; } }

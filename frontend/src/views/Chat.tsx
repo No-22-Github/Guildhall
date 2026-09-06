@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm'
 import { api, STATE_COLOR, STATE_LABEL } from '../api'
 import { useEventStream } from '../useEventStream'
 import { useQuestStatusStream } from '../useStatusStream'
-import AgentStatusPanel, { displayToolName } from '../components/AgentStatusPanel'
+import AgentStatusPanel, { displayToolName, ACTIVITY_LABEL } from '../components/AgentStatusPanel'
 
 interface UserItem {
   kind: 'user'
@@ -191,9 +191,10 @@ function MarkdownMessage({ text }: { text: string }) {
   return <div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown></div>
 }
 
-export default function Chat({ questId, onBack, onGotoReview, onDirty }: { onDirty?: (dirty: boolean) => void; questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
+export default function Chat({ questId, onBack, onGotoReview, onDirty, project }: { project?: string; onDirty?: (dirty: boolean) => void; questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
   const detail = useQuestStatusStream(questId)
   const [input, setInput] = useState('')
+  const [showQuest, setShowQuest] = useState(true)
   const [questDraft, setQuestDraft] = useState<string | null>(null)
   useEffect(() => { onDirty?.(Boolean(input.trim()) || (questDraft !== null && questDraft !== detail?.quest_md)); return () => onDirty?.(false) }, [input, questDraft, detail?.quest_md, onDirty])
   const [error, setError] = useState('')
@@ -324,16 +325,18 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty }: { onDir
   }
 
   // §2.4:需求单生成前只渲染对话栏并居中;生成后切成两栏。
-  const hasQuestPanel = questDraft != null || Boolean(detail?.quest_md)
+  const hasQuestDocument = questDraft != null || Boolean(detail?.quest_md)
+  const hasQuestPanel = hasQuestDocument && showQuest
 
   return (
-    <div className="flex h-screen flex-col">
-      <header className="flex items-center gap-3 border-b p-3">
+    <div className="chat-workspace flex h-screen flex-col">
+      <header className="chat-toolbar flex items-center gap-3 border-b p-3">
         <button className="text-sm text-blue-600" onClick={onBack}>← 大厅</button>
-        <span className="font-mono text-xs text-gray-400">{questId}</span>
+        <div className="chat-heading"><strong>前台 · 委托洽谈</strong><span title={project || detail?.state.project}>{project || detail?.state.project}</span></div>
         {state && <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATE_COLOR[state]}`}>{STATE_LABEL[state]}</span>}
         {detail?.state.error && <span className="flex-1 truncate rounded bg-red-50 px-2 py-1 text-xs text-red-700" title={detail.state.error}>⚠ {detail.state.error}</span>}
         <div className="flex-1" />
+        {hasQuestDocument && <button className="rounded border px-3 py-2 text-sm" onClick={() => setShowQuest(v => !v)}>{showQuest ? '收起委托书' : '展开委托书'}</button>}
         {drafting && <button className="rounded border px-3 py-2 text-sm" disabled={actionBusy} onClick={async () => { if (!window.confirm('放弃这张草稿委托？')) return; setActionBusy(true); try { await api.transition(questId, 'withdrawn'); setQuestDraft(null); setInput('') } catch (e) { setError(String(e)) } finally { setActionBusy(false) } }}>放弃草稿</button>}
         {drafting && (
           <button
@@ -349,14 +352,14 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty }: { onDir
         )}
       </header>
 
-      <div className={hasQuestPanel ? 'flex min-h-0 flex-1' : 'flex min-h-0 flex-1 justify-center'}>
-        <div className={hasQuestPanel ? 'flex min-w-0 flex-1 flex-col border-r' : 'flex w-full max-w-3xl flex-col'}>
+      <div className={`chat-columns flex min-h-0 flex-1 ${hasQuestPanel ? 'has-quest' : ''}`}>
+        <div className="chat-column flex min-w-0 flex-1 flex-col">
           {!hasQuestPanel && error && (
             <div className="m-3 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</div>
           )}
-          <div className="border-b bg-gray-50 px-4 py-2"><AgentStatusPanel roleName="前台" status={agentStatus} completedTools={completedTools} /></div>
+          <details className="chat-runtime"><summary><span className={agentStatus?.busy ? 'runtime-dot working' : 'runtime-dot'} />{agentStatus ? ACTIVITY_LABEL[agentStatus.activity] : '会话未连接'}{agentStatus?.active_tool && <span> · {agentStatus.active_tool.title || agentStatus.active_tool.name}</span>}{agentStatus?.busy && agentStatus.seconds_since_event >= 15 && <span> · {Math.round(agentStatus.seconds_since_event)} 秒无新事件</span>}<small>运行详情</small></summary><div><AgentStatusPanel roleName="前台" status={agentStatus} completedTools={completedTools} /></div></details>
           <div className="relative min-h-0 flex-1">
-            <div ref={flowRef} className="h-full space-y-3 overflow-y-auto p-4" onScroll={handleFlowScroll}>
+            <div ref={flowRef} className="chat-transcript h-full space-y-3 overflow-y-auto" onScroll={handleFlowScroll}>
               {timeline.map((item, index) => {
                 if (item.kind === 'tool') return <ToolCard key={`tool-${item.toolId}`} tool={item} />
                 if (item.kind === 'divider') return <div key={`divider-${index}`} className="reply-divider"><span>工具执行后继续回复</span></div>
@@ -365,7 +368,7 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty }: { onDir
                 }
                 return (
                   <div key={`${item.kind}-${index}`} className={`flex ${item.kind === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`max-w-[78%] rounded-lg px-3 py-2 text-sm ${item.kind === 'user' ? 'whitespace-pre-wrap bg-blue-600 text-white' : 'bg-gray-100 text-gray-900'}`}>
+                    <div className={`chat-message ${item.kind === 'user' ? 'user-message whitespace-pre-wrap bg-blue-600 text-white' : 'agent-message text-gray-900'}`}>
                       {item.kind === 'agent' ? <MarkdownMessage text={item.text} /> : item.text}
                     </div>
                   </div>
@@ -382,11 +385,11 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty }: { onDir
             )}
           </div>
           {drafting && (
-            <div className="border-t p-3">
+            <div className="chat-composer border-t">
               <div className="flex items-end gap-2">
                 <textarea
-                  className="max-h-48 min-h-20 flex-1 resize-y rounded border p-2 text-sm"
-                  rows={3}
+                  className="max-h-48 flex-1 resize-y rounded border p-2 text-sm"
+                  rows={2}
                   placeholder="回答前台的问题；Agent 工作时也可以直接插话"
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
@@ -399,13 +402,13 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty }: { onDir
                 />
                 <button className="h-10 rounded bg-blue-600 px-4 text-sm text-white disabled:opacity-50" disabled={!input.trim()} onClick={() => void send()}>发送</button>
               </div>
-              <div className="mt-1 text-[11px] text-gray-400">Enter 发送 · Shift + Enter 换行 · 工作中发送会直接注入当前 Claude Code turn</div>
+              <div className="mt-1 text-[11px] text-gray-400">Enter 发送 · Shift + Enter 换行 · 工作中也可补充说明</div>
             </div>
           )}
         </div>
 
         {hasQuestPanel && (
-          <div className="flex w-[42%] min-w-[360px] flex-col">
+          <div className="quest-document flex flex-col">
             {error && <div className="m-3 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</div>}
             {questDraft != null ? (
               <div className="flex min-h-0 flex-1 flex-col p-3">

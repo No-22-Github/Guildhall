@@ -40,7 +40,7 @@ export default function TavernScene({
             .slice(0, 4)
             .map((q) => (
               <button
-                title={`${q.title || q.id} · ${STATE_LABEL[q.state]}`}
+                title={`${q.project} · ${q.title || q.id} · ${STATE_LABEL[q.state]}`}
                 aria-label={`打开委托：${q.title || q.id}`}
                 className={`paper state-${q.state}`}
                 key={q.id}

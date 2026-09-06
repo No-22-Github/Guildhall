@@ -36,7 +36,10 @@ function savePref(key: string, value: string) {
 export default function App() {
   const quests = useQuestListStream()
   const [projects, setProjects] = useState<string[]>([])
+  // Project selection belongs to reception; other desks have their own filter.
   const [project, setProject] = useState('')
+  const [projectFilter, setProjectFilter] = useState('')
+  const [questProject, setQuestProject] = useState('')
   const [panel, setPanel] = useState<Panel | null>(null)
   const [questId, setQuestId] = useState('')
   const [skinId, setSkinId] = useState(() => pref('guildhall.skin', 'tavern'))
@@ -53,9 +56,8 @@ export default function App() {
   const [confirmClose, setConfirmClose] = useState(false)
   const dialog = useRef<HTMLDialogElement>(null)
   const skin = getSkin(skinId)
-  const current = quests.filter((q) => q.project === project)
-  const active = current.filter((q) => q.state === 'in_progress')
-  const review = current.filter(
+  const active = quests.filter((q) => q.state === 'in_progress')
+  const review = quests.filter(
     (q) => q.state === 'appraised' || q.state === 'disputed',
   )
   function receiveProjects(result: { path: string }[]) {
@@ -107,11 +109,13 @@ export default function App() {
   function open(next: Panel) {
     setConfirmClose(false)
     setSearch('')
+    setProjectFilter('')
     setError('')
     setPanel(next)
   }
   function openQuest(q: QuestSummary) {
     setQuestId(q.id)
+    setQuestProject(q.project)
     open(q.state === 'drafting' ? 'chat' : 'review')
   }
   function station(id: StationId) {
@@ -127,6 +131,7 @@ export default function App() {
     try {
       const result = await api.createQuest(project, message || null)
       setQuestId(result.id)
+      setQuestProject(project)
       setMessage('')
       setPanel('chat')
     } catch (e) {
@@ -151,7 +156,12 @@ export default function App() {
       setBusy(false)
     }
   }
-  const visible = current
+  const visible = quests
+    .filter((q) =>
+      panel === 'new'
+        ? q.project === project
+        : !projectFilter || q.project === projectFilter,
+    )
     .filter((q) => {
       if (panel === 'archive') return terminal.has(q.state)
       if (panel === 'adventurer')
@@ -197,7 +207,9 @@ export default function App() {
             <span className={`seal state-${q.state}`} />
             <span>
               <strong>{q.title || '尚未定稿的委托'}</strong>
-              <small>{q.id}</small>
+              <small title={q.project}>
+                {q.project} · {q.id}
+              </small>
             </span>
             <span className={`status state-${q.state}`}>
               {STATE_LABEL[q.state]}
@@ -237,26 +249,6 @@ export default function App() {
             GUILDHALL<small>冒险家协会</small>
           </span>
         </a>
-        <div className="project-select">
-          <span>当前项目</span>
-          <select
-            aria-label="当前项目"
-            value={project}
-            onChange={(e) => {
-              setProject(e.target.value)
-              savePref('guildhall.project', e.target.value)
-            }}
-          >
-            <option value="" disabled>
-              选择一个项目
-            </option>
-            {projects.map((p) => (
-              <option key={p} value={p}>
-                {p.split('/').filter(Boolean).pop()}
-              </option>
-            ))}
-          </select>
-        </div>
         <div className="hall-counts">
           <button onClick={() => open('adventurer')}>
             进行中 <b>{active.length}</b>
@@ -283,17 +275,10 @@ export default function App() {
           <div>
             <span className="eyebrow">YOUR NEXT ADVENTURE STARTS HERE</span>
             <h1>欢迎回到公会。</h1>
-            <p>
-              {project
-                ? '一份委托，一次冒险。让想法在这里成为现实。'
-                : '先登记一个项目，再让前台帮你整理第一份委托。'}
-            </p>
+            <p>找前台聊聊想法，或去委托板看看大家的进展。</p>
           </div>
-          <button
-            className="primary"
-            onClick={() => open(project ? 'new' : 'projects')}
-          >
-            ＋ {project ? '发布新委托' : '登记第一个项目'}
+          <button className="primary" onClick={() => open('new')}>
+            ＋ 找前台发布委托
           </button>
         </div>
         {error && !panel && (
@@ -311,7 +296,7 @@ export default function App() {
         )}
         <TavernScene
           skin={skin}
-          quests={current}
+          quests={quests}
           onStation={station}
           onQuest={openQuest}
         />
@@ -326,12 +311,14 @@ export default function App() {
           ))}
         </nav>
         <footer className="hall-footer">
-          <span title={project}>{project || '尚未登记项目'}</span>
-          <button onClick={() => open('projects')}>＋ 登记项目</button>
+          <span>
+            {projects.length} 个项目 · {quests.length} 份委托
+          </span>
           <span>自动鉴定之后，由你决定交付。</span>
         </footer>
       </main>
       <dialog
+        aria-label={panel ? titles[panel] : undefined}
         ref={dialog}
         className={`hall-dialog ${panel === 'chat' || panel === 'review' ? 'workspace-dialog' : ''}`}
         onCancel={(e) => {
@@ -339,7 +326,8 @@ export default function App() {
           close()
         }}
       >
-        <div className="dialog-heading">
+        {panel && !['chat', 'review'].includes(panel) && (
+          <div className="dialog-heading">
           <span>
             <small>GUILDHALL / </small>
             {panel && titles[panel]}
@@ -348,6 +336,7 @@ export default function App() {
             ✕
           </button>
         </div>
+        )}
         {confirmClose && (
           <div className="notice">
             模型配置尚未保存。
@@ -366,6 +355,11 @@ export default function App() {
         {error && panel && (
           <div role="alert" className="notice error">
             {error}
+          </div>
+        )}
+        {panel === 'review' && (
+          <div className="quest-project-context" title={questProject}>
+            所属项目 · {questProject}
           </div>
         )}
         <div className="dialog-body">
@@ -387,6 +381,7 @@ export default function App() {
           )}
           {panel === 'chat' && (
             <Chat
+              project={questProject}
               onDirty={setChatDirty}
               key={questId}
               questId={questId}
@@ -438,6 +433,36 @@ export default function App() {
                   void create()
                 }}
               >
+                <div className="reception-project">
+                  <label>
+                    这份委托属于哪个项目？
+                    <select
+                      aria-label="委托所属项目"
+                      value={project}
+                      disabled={busy}
+                      onChange={(e) => {
+                        setProject(e.target.value)
+                        savePref('guildhall.project', e.target.value)
+                      }}
+                    >
+                      <option value="" disabled>
+                        先选择或登记一个项目
+                      </option>
+                      {projects.map((p) => (
+                        <option key={p} value={p}>
+                          {p}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => open('projects')}
+                  >
+                    ＋ 登记新项目
+                  </button>
+                </div>
                 <label>
                   这次的想法
                   <textarea
@@ -462,9 +487,7 @@ export default function App() {
           {panel &&
             ['board', 'adventurer', 'appraiser', 'archive'].includes(panel) && (
               <div className="panel-content">
-                <span className="eyebrow">
-                  {project.split('/').pop() || '尚未选择项目'}
-                </span>
+                <span className="eyebrow">全公会委托</span>
                 <h2>{titles[panel]}</h2>
                 <p>
                   {panel === 'appraiser'
@@ -475,6 +498,23 @@ export default function App() {
                         ? '每次冒险留下的成果与记录。'
                         : '从草稿到交付，每一份委托都在这里。'}
                 </p>
+                <label className="project-filter">
+                  筛选项目
+                  <select
+                    aria-label="筛选项目"
+                    value={projectFilter}
+                    onChange={(e) => setProjectFilter(e.target.value)}
+                  >
+                    <option value="">所有项目</option>
+                    {Array.from(
+                      new Set([...projects, ...quests.map((q) => q.project)]),
+                    ).map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 {list}
               </div>
             )}

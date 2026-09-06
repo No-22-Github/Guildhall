@@ -4,6 +4,7 @@ export type StationId =
   | 'adventurer'
   | 'appraiser'
   | 'archive'
+  | 'settings'
 export interface Skin {
   id: string
   name: string
@@ -65,6 +66,13 @@ const tavern: Skin = {
       hint: '已完成与放弃的委托',
       x: 94,
       y: 78,
+    },
+    {
+      id: 'settings',
+      label: '公会手册',
+      hint: '模型设置与大厅外观',
+      x: 65,
+      y: 72,
     },
   ],
   board: { x: 39, y: 16, width: 20, height: 20 },

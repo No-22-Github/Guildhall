@@ -116,11 +116,14 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
 
   return (
     <div className="flex h-screen flex-col">
-      <header className="flex items-center gap-3 border-b p-3">
+      <header className="chat-toolbar flex items-center gap-3 border-b p-3">
         <button className="text-sm text-blue-600" onClick={onBack}>
           ← 大厅
         </button>
-        <span className="font-mono text-xs text-gray-400">{questId}</span>
+        <div className="chat-heading">
+          <strong>验收台 · 执行与鉴定</strong>
+          <span title={questId}>{questId}</span>
+        </div>
         {state && (
           <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATE_COLOR[state]}`}>{STATE_LABEL[state]}</span>
         )}
