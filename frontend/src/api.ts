@@ -169,3 +169,17 @@ export const STATE_COLOR: Record<QuestState, string> = {
   failed: 'bg-gray-200 text-gray-500',
   withdrawn: 'bg-gray-200 text-gray-500',
 }
+
+export type RoleId = 'receptionist' | 'adventurer' | 'appraiser'
+export interface SettingsSnapshot {
+  revision: string
+  roles: Record<RoleId, { model: string; base_url: string; has_token: boolean }>
+  restart_required: boolean
+  agent_name: string
+  agent_mode: string
+}
+export const settingsApi = {
+  get: () => req<SettingsSnapshot>('/api/settings'),
+  save: (body: { revision: string; roles: Record<RoleId, { model: string; base_url: string; auth_token: string | null; clear_token: boolean }> }) =>
+    req<SettingsSnapshot>('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+}

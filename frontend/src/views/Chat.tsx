@@ -191,10 +191,11 @@ function MarkdownMessage({ text }: { text: string }) {
   return <div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown></div>
 }
 
-export default function Chat({ questId, onBack, onGotoReview }: { questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
+export default function Chat({ questId, onBack, onGotoReview, onDirty }: { onDirty?: (dirty: boolean) => void; questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
   const detail = useQuestStatusStream(questId)
   const [input, setInput] = useState('')
   const [questDraft, setQuestDraft] = useState<string | null>(null)
+  useEffect(() => { onDirty?.(Boolean(input.trim()) || (questDraft !== null && questDraft !== detail?.quest_md)); return () => onDirty?.(false) }, [input, questDraft, detail?.quest_md, onDirty])
   const [error, setError] = useState('')
   const [actionBusy, setActionBusy] = useState(false)
   const [generationRequested, setGenerationRequested] = useState(false)
@@ -333,6 +334,7 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
         {state && <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATE_COLOR[state]}`}>{STATE_LABEL[state]}</span>}
         {detail?.state.error && <span className="flex-1 truncate rounded bg-red-50 px-2 py-1 text-xs text-red-700" title={detail.state.error}>⚠ {detail.state.error}</span>}
         <div className="flex-1" />
+        {drafting && <button className="rounded border px-3 py-2 text-sm" disabled={actionBusy} onClick={async () => { if (!window.confirm('放弃这张草稿委托？')) return; setActionBusy(true); try { await api.transition(questId, 'withdrawn'); setQuestDraft(null); setInput('') } catch (e) { setError(String(e)) } finally { setActionBusy(false) } }}>放弃草稿</button>}
         {drafting && (
           <button
             className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
@@ -342,7 +344,7 @@ export default function Chat({ questId, onBack, onGotoReview }: { questId: strin
           >{generationRequested ? '生成中…' : '生成需求单'}</button>
         )}
         {state === 'posted' && <button className="rounded bg-green-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50" disabled={actionBusy} onClick={dispatch}>派单</button>}
-        {(state === 'in_progress' || state === 'appraising' || state === 'appraised' || state === 'disputed' || state === 'failed') && (
+        {(state && state !== 'drafting' && state !== 'posted') && (
           <button className="rounded border px-4 py-2 text-sm" onClick={() => onGotoReview(questId)}>去 review →</button>
         )}
       </header>

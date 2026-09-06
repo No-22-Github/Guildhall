@@ -528,9 +528,18 @@ def parse_appraisal(raw: str, quest_md: str | None = None) -> Optional[dict[str,
         return None
     if quest_md is not None:
         steps = [re.sub(r"^\d+\.\s*", "", s) for s in acceptance_steps(quest_md)]
-        if [c["step"] for c in checks] != steps:
+        if len(checks) != len(steps):
             return None
+        for c, s in zip(checks, steps):
+            # appraiser 常把步骤下的命令块一并复制进 step,或改排换行缩进;
+            # 空白归一后前缀匹配,只锚定步骤标题,标题被改写才算失配。
+            if not _norm_ws(c["step"]).startswith(_norm_ws(s)):
+                return None
     return result
+
+
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
 
 
 # 改了这些路径 = 改了测试/断言/CI(§2.6 确定性检测的判定面)

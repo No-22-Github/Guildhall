@@ -112,6 +112,9 @@ def build_app(context: AppContext) -> FastAPI:
         allow_headers=["*"],
     )
 
+    from .settings import install as install_settings
+    install_settings(app, context)
+
     # ---- projects ----
 
     @app.get("/api/projects")

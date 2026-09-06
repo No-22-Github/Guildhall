@@ -32,6 +32,18 @@ scripts/    e2e_check.sh —— 验收脚本
 
 前置:`uv`、`pnpm`、`claude` CLI(已登录)、`git`。
 
+一键启动前后端（自动同步依赖，不打开浏览器）：
+
+```bash
+./scripts/dev.sh
+# 前端端口被占用时可指定其他端口
+./scripts/dev.sh --port 5175
+```
+
+后端端口读取 `~/.guildhall/config.toml` 的 `[server].port`（默认 8420），前端代理自动跟随；默认前端端口 5173。按 Ctrl+C 同时停止两端；任一服务退出会清理另一端。只清理脚本自己创建的进程组，不停止其他已运行的服务。模型设置保存后，重启此脚本即可生效。
+
+首次使用仍需先安装下述 sandbox-agent 并登录 Claude。也可以分别启动：
+
 ```bash
 # 1. 安装 sandbox-agent(M0 考古版:0.4.x)
 curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh
@@ -100,3 +112,9 @@ M5 负向二(appraiser 弄脏 worktree → 结论整份作废)是确定性闸门
 - quest id 的 slug 取自开场白的前几个 ASCII 词元(中文开场白会得到 `draft`),
   规格书「slug 由 receptionist 给出」在实现里让位给了 id 与目录的一致性。
 - worktree 不自动清理,留给你看 diff。
+
+## 像素公会与设置
+
+首页现在是可交互的像素酒馆：点击前台、委托板、冒险者、鉴定台和档案柜即可进入对应操作；窄屏可使用场景下方的设施快捷入口。设置页提供外观切换、减少动画，以及三角色的模型/API 配置。模型配置保存后需重启后端生效，已有密钥不会回显或因留空被清除。
+
+皮肤配置、素材制作约定及设置 API 说明见 [docs/tavern-frontend.md](docs/tavern-frontend.md)。

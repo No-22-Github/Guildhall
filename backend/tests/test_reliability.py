@@ -25,6 +25,18 @@ def test_appraisal_rejects_incomplete_contract(make_quest, change):
     assert flow.parse_appraisal(json.dumps(result), md) is None
 
 
+def test_appraisal_step_prefix_tolerates_multiline_and_ws(make_quest):
+    md = _valid_quest_md(make_quest())
+    result = valid_result(md)
+    # appraiser 把命令块一并复制进 step,且空白重排:前缀匹配应放行
+    result['checks'][0]['step'] += '\n\n     go build ./... && go test ./...\n\n   pass = 退出码全为 0。'
+    assert flow.parse_appraisal(json.dumps(result), md) is not None
+    # 标题行本身改写(非空白差异):仍拒绝
+    rewritten = valid_result(md)
+    rewritten['checks'][0]['step'] = '构建全绿(改写): go build'
+    assert flow.parse_appraisal(json.dumps(rewritten), md) is None
+
+
 def test_gates_and_globs(make_quest):
     md = _valid_quest_md(make_quest())
     assert questmd.acceptance_gate_error(md) is None
