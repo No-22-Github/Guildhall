@@ -381,6 +381,7 @@ export default function App() {
           )}
           {panel === 'chat' && (
             <Chat
+              sceneFilter={skin.filter}
               project={questProject}
               onDirty={setChatDirty}
               key={questId}

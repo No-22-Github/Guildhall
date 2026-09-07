@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { api, STATE_COLOR, STATE_LABEL } from '../api'
+import { api, STATE_LABEL } from '../api'
 import { useEventStream } from '../useEventStream'
 import { useQuestStatusStream } from '../useStatusStream'
+import ReceptionScene from '../components/ReceptionScene'
+import QuestDocument from '../components/QuestDocument'
+import '../reception.css'
 import AgentStatusPanel, { displayToolName, ACTIVITY_LABEL } from '../components/AgentStatusPanel'
 
 interface UserItem {
@@ -182,7 +185,7 @@ function ToolCard({ tool }: { tool: ToolItem }) {
   const state = running ? 'is-running' : tool.status === 'failed' ? 'is-failed' : tool.status === 'cancelled' ? 'is-cancelled' : ''
   return (
     <div className="flex justify-start">
-      <details className={`tool-card ${state}`} open={running}>
+      <details className={`tool-card ${state}`}>
         <summary>
           <span className="tool-dot" />
           <span className="tool-name">{displayToolName(tool.name)}</span>
@@ -192,7 +195,7 @@ function ToolCard({ tool }: { tool: ToolItem }) {
         <div className="tool-body">
           {command && <ToolSection title="执行命令" text={command} />}
           {file && !command && <ToolSection title="文件" text={file} />}
-          {input && !command && <ToolSection title="参数" text={JSON.stringify(input, null, 2)} />}
+          {input && <ToolSection title="参数" text={JSON.stringify(input, null, 2)} />}
           {tool.output && <ToolSection title="输出" text={tool.output} />}
           {!input && !tool.output && <p className="tool-waiting">等待 Claude Code 返回工具详情…</p>}
         </div>
@@ -201,55 +204,88 @@ function ToolCard({ tool }: { tool: ToolItem }) {
   )
 }
 
-function ToolGroup({ group }: { group: ToolGroupItem }) {
-  const tools = group.tools
-  const firstRunning = tools.findIndex((tool) => !isToolTerminal(tool))
-  const failed = tools.filter((tool) => tool.status === 'failed').length
-  if (firstRunning === -1) {
-    return (
-      <div className="flex justify-start">
-        <details className={`tool-card tool-group ${failed ? 'is-failed' : ''}`}>
-          <summary>
-            <span className="tool-dot" />
-            <span className="tool-name">工具调用</span>
-            <span className="tool-title">共使用了 {tools.length} 个工具{failed > 0 && `，${failed} 个失败`}</span>
-            <small>详情</small>
-          </summary>
-          <div className="tool-body">
-            {tools.map((tool) => <ToolCard key={tool.toolId} tool={tool} />)}
-          </div>
-        </details>
-      </div>
-    )
+function toolSummary(tools: ToolItem[]) {
+  const counts = new Map<string, number>()
+  for (const tool of tools) {
+    const label = ({ Read: '读取文件', ReadFile: '读取文件', Grep: '搜索', Glob: '查找文件', Bash: '执行命令', Terminal: '执行命令', Edit: '编辑文件', Write: '写入文件' } as Record<string, string>)[tool.name] ?? displayToolName(tool.name)
+    counts.set(label, (counts.get(label) ?? 0) + 1)
   }
-  const visible = tools.slice(Math.max(0, firstRunning - 1))
+  return [...counts].map(([name, count]) => `${name} ${count} 次`).join(' · ')
+}
+
+function ToolGroup({ group }: { group: ToolGroupItem }) {
+  const running = group.tools.filter(tool => !isToolTerminal(tool))
+  const failed = group.tools.filter(tool => tool.status === 'failed').length
+  const cancelled = group.tools.filter(tool => tool.status === 'cancelled').length
+  const completed = group.tools.filter(tool => tool.status === 'completed').length
   return (
-    <div className="tool-group-live">
-      <div className="tool-group-count">工具调用 · 已使用 {tools.length} 个</div>
-      {visible.map((tool) => <ToolCard key={tool.toolId} tool={tool} />)}
-    </div>
+    <details className={`work-record ${running.length ? 'is-running' : ''} ${failed ? 'is-failed' : ''}`}>
+      <summary>
+        <span className="work-indicator" aria-hidden="true">{failed ? '!' : running.length ? '◌' : cancelled ? '−' : '✓'}</span>
+        <span className="work-summary" title={running.length ? running.map(t => t.title).join(' · ') : toolSummary(group.tools)}>
+          {running.length ? `${running.length > 1 ? `正在执行 ${running.length} 项` : running[0].title} · 已完成 ${completed} 项` : toolSummary(group.tools)}
+        </span>
+        {failed > 0 && <span className="work-failure">{failed} 项失败</span>}
+        {cancelled > 0 && <span>{cancelled} 项取消</span>}
+        <span className="work-disclosure">详情</span>
+      </summary>
+      <div className="work-items">{group.tools.map(tool => <ToolCard key={tool.toolId} tool={tool} />)}</div>
+    </details>
   )
 }
 
 function ToolSection({ title, text }: { title: string; text: string }) {
-  return (
-    <section>
-      <div className="tool-section-title">{title}</div>
-      <pre>{text}</pre>
-    </section>
-  )
+  const [copied, setCopied] = useState('')
+  return <section>
+    <div className="tool-section-title">{title}<button onClick={async () => {
+      try { await navigator.clipboard.writeText(text); setCopied('已复制') }
+      catch { setCopied('复制失败，请选择文本复制') }
+    }}>{copied || '复制'}</button></div>
+    <pre tabIndex={0}>{text}</pre>
+  </section>
 }
 
 function MarkdownMessage({ text }: { text: string }) {
   return <div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown></div>
 }
 
-export default function Chat({ questId, onBack, onGotoReview, onDirty, project }: { project?: string; onDirty?: (dirty: boolean) => void; questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
+export default function Chat({ questId, onBack, onGotoReview, onDirty, project, sceneFilter }: { sceneFilter?: string; project?: string; onDirty?: (dirty: boolean) => void; questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
   const detail = useQuestStatusStream(questId)
   const [input, setInput] = useState('')
-  const [showQuest, setShowQuest] = useState(true)
+  const [showQuest, setShowQuest] = useState(false)
+  const [focusQuest, setFocusQuest] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [savedQuest, setSavedQuest] = useState<string | null>(null)
+  const [split, setSplit] = useState(() => {
+    try { const n = Number(localStorage.getItem('guildhall.chatSplit')); return n >= 35 && n <= 65 ? n : 45 } catch { return 45 }
+  })
+  const columnsRef = useRef<HTMLDivElement>(null)
+  const readingAnchor = useRef<{ element: Element; offset: number; atBottom: boolean } | null>(null)
+  const layoutChanging = useRef(false)
+  function rememberReading() {
+    const flow = flowRef.current
+    if (!flow || !flow.clientHeight) return
+    const top = flow.getBoundingClientRect().top
+    const candidates = [...flow.querySelectorAll('.markdown-body p, .markdown-body li, .markdown-body pre, .markdown-body h1, .markdown-body h2, .markdown-body h3, .user-message, .work-record')]
+    const visible = candidates.filter(el => el.getBoundingClientRect().bottom > top)
+    const element = visible.find(el => el.getBoundingClientRect().top >= top) ?? visible[0]
+    if (element) readingAnchor.current = { element, offset: element.getBoundingClientRect().top - top, atBottom: followingLatest }
+    layoutChanging.current = true
+  }
+  function toggleQuest() { rememberReading(); setShowQuest(v => !v); setFocusQuest(false) }
+  useLayoutEffect(() => {
+    const flow = flowRef.current
+    const anchor = readingAnchor.current
+    if (flow && flow.clientHeight && anchor) {
+      if (anchor.atBottom) flow.scrollTop = flow.scrollHeight
+      else flow.scrollTop += anchor.element.getBoundingClientRect().top - flow.getBoundingClientRect().top - anchor.offset
+    }
+    const frame = requestAnimationFrame(() => { layoutChanging.current = false })
+    return () => cancelAnimationFrame(frame)
+  }, [showQuest, focusQuest, split])
+  useEffect(() => { try { localStorage.setItem('guildhall.chatSplit', String(split)) } catch { /* optional preference */ } }, [split])
   const [questDraft, setQuestDraft] = useState<string | null>(null)
-  useEffect(() => { onDirty?.(Boolean(input.trim()) || (questDraft !== null && questDraft !== detail?.quest_md)); return () => onDirty?.(false) }, [input, questDraft, detail?.quest_md, onDirty])
+  useEffect(() => { onDirty?.(Boolean(input.trim()) || (questDraft !== null && questDraft !== (savedQuest ?? detail?.quest_md))); return () => onDirty?.(false) }, [input, questDraft, detail?.quest_md, savedQuest, onDirty])
   const [error, setError] = useState('')
   const [actionBusy, setActionBusy] = useState(false)
   const [generationRequested, setGenerationRequested] = useState(false)
@@ -259,26 +295,16 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
   const flowRef = useRef<HTMLDivElement>(null)
   const lastReadEventCountRef = useRef(0)
 
-  // 历史工具链(A → B → C)与运行中工具分开;运行中的那个由面板从 status 呈现
-  const completedTools = useMemo(() => {
-    const seen = new Map<string, string>()
-    const out: string[] = []
-    for (const { env } of events) {
-      const u = env.params?.update
-      if (!u || (u.sessionUpdate !== 'tool_call' && u.sessionUpdate !== 'tool_call_update')) continue
-      const id = u.toolCallId ?? ''
-      if (seen.has(id)) continue
-      const name = u._meta?.claudeCode?.toolName ?? u.title ?? '工具'
-      seen.set(id, name)
-      out.push(name)
-    }
-    return out
-  }, [events])
+  const completedTools = useMemo(() => timeline.flatMap(item => item.kind === 'toolGroup'
+    ? item.tools.filter(tool => tool.status === 'completed').map(tool => tool.name) : []), [timeline])
+
+  // A successful local response bridges SSE latency, then live server updates own the document again.
+  useEffect(() => { if (savedQuest !== null && detail?.quest_md === savedQuest) setSavedQuest(null) }, [detail?.quest_md, savedQuest])
 
   useEffect(() => {
     if (!detail || !generationRequested) return
     if (detail.quest_md) {
-      setQuestDraft(detail.quest_md)
+      setSavedQuest(detail.quest_md)
       setGenerationRequested(false)
     } else if (detail.state.error && !detail.runtime?.receptionist?.busy) {
       setGenerationRequested(false)
@@ -287,15 +313,15 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
   }, [detail, generationRequested])
 
   useEffect(() => {
-    if (!followingLatest) return
+    if (!followingLatest || layoutChanging.current || focusQuest) return
     const flow = flowRef.current
     if (flow) flow.scrollTo({ top: flow.scrollHeight })
     lastReadEventCountRef.current = events.length
-  }, [events.length, followingLatest])
+  }, [events.length, followingLatest, focusQuest])
 
   function handleFlowScroll() {
     const flow = flowRef.current
-    if (!flow) return
+    if (!flow || layoutChanging.current) return
     const nearBottom = flow.scrollHeight - flow.scrollTop - flow.clientHeight < 64
     if (!nearBottom && followingLatest) lastReadEventCountRef.current = events.length
     if (nearBottom) lastReadEventCountRef.current = events.length
@@ -339,7 +365,7 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
     try {
       const result = await api.generate(questId)
       if (!result.ok) setError(result.reason ?? '生成失败')
-      else if (result.quest_md) setQuestDraft(result.quest_md)
+      else if (result.quest_md) setSavedQuest(result.quest_md)
       else setGenerationRequested(true)
     } catch (e) {
       setError(String(e))
@@ -349,12 +375,13 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
   }
 
   async function post() {
-    const text = questDraft ?? detail?.quest_md
+    const text = questDraft ?? savedQuest ?? detail?.quest_md
     if (!text) return
     setActionBusy(true)
     setError('')
     try {
       await api.putQuest(questId, text)
+      setSavedQuest(text)
       await api.transition(questId, 'posted')
       setQuestDraft(null)
     } catch (e) {
@@ -377,8 +404,19 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
     }
   }
 
-  // §2.4:需求单生成前只渲染对话栏并居中;生成后切成两栏。
-  const hasQuestDocument = questDraft != null || Boolean(detail?.quest_md)
+  async function saveDocument() {
+    const text = questDraft ?? savedQuest ?? detail?.quest_md
+    if (!text) return
+    setActionBusy(true); setError('')
+    try { await api.putQuest(questId, text); setSavedQuest(text); setQuestDraft(null); setEditing(false) }
+    catch (e) { setError(String(e)) }
+    finally { setActionBusy(false) }
+  }
+  // Keep the drawer mounted so scroll positions and editor selection survive hiding.
+  const documentText = questDraft ?? savedQuest ?? detail?.quest_md ?? ''
+  const documentDirty = questDraft !== null && questDraft !== (savedQuest ?? detail?.quest_md)
+
+  const hasQuestDocument = Boolean(documentText)
   const hasQuestPanel = hasQuestDocument && showQuest
 
   return (
@@ -386,10 +424,10 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
       <header className="chat-toolbar flex items-center gap-3 border-b p-3">
         <button className="text-sm text-blue-600" onClick={onBack}>← 大厅</button>
         <div className="chat-heading"><strong>前台 · 委托洽谈</strong><span title={project || detail?.state.project}>{project || detail?.state.project}</span></div>
-        {state && <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATE_COLOR[state]}`}>{STATE_LABEL[state]}</span>}
+        {state && <span className="chat-state">{STATE_LABEL[state]}</span>}
         {detail?.state.error && <span className="flex-1 truncate rounded bg-red-50 px-2 py-1 text-xs text-red-700" title={detail.state.error}>⚠ {detail.state.error}</span>}
         <div className="flex-1" />
-        {hasQuestDocument && <button className="rounded border px-3 py-2 text-sm" onClick={() => setShowQuest(v => !v)}>{showQuest ? '收起委托书' : '展开委托书'}</button>}
+        {hasQuestDocument && <button className="rounded border px-3 py-2 text-sm" onClick={toggleQuest}>{showQuest ? '收起需求单 →' : '查看需求单'}</button>}
         {drafting && <button className="rounded border px-3 py-2 text-sm" disabled={actionBusy} onClick={async () => { if (!window.confirm('放弃这张草稿委托？')) return; setActionBusy(true); try { await api.transition(questId, 'withdrawn'); setQuestDraft(null); setInput('') } catch (e) { setError(String(e)) } finally { setActionBusy(false) } }}>放弃草稿</button>}
         {drafting && (
           <button
@@ -405,24 +443,26 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
         )}
       </header>
 
-      <div className={`chat-columns flex min-h-0 flex-1 ${hasQuestPanel ? 'has-quest' : ''}`}>
+      <div ref={columnsRef} style={{ '--chat-split': `${split}%` } as CSSProperties} className={`chat-columns flex min-h-0 flex-1 ${hasQuestPanel ? 'has-quest' : ''} ${hasQuestPanel && focusQuest ? 'document-focused' : ''}`}>
+
         <div className="chat-column flex min-w-0 flex-1 flex-col">
           {!hasQuestPanel && error && (
             <div className="m-3 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</div>
           )}
           <details className="chat-runtime"><summary><span className={agentStatus?.busy ? 'runtime-dot working' : 'runtime-dot'} />{agentStatus ? ACTIVITY_LABEL[agentStatus.activity] : '会话未连接'}{agentStatus?.active_tool && <span> · {agentStatus.active_tool.title || agentStatus.active_tool.name}</span>}{agentStatus?.busy && agentStatus.seconds_since_event >= 15 && <span> · {Math.round(agentStatus.seconds_since_event)} 秒无新事件</span>}<small>运行详情</small></summary><div><AgentStatusPanel roleName="前台" status={agentStatus} completedTools={completedTools} /></div></details>
           <div className="relative min-h-0 flex-1">
-            <div ref={flowRef} className="chat-transcript h-full space-y-3 overflow-y-auto" onScroll={handleFlowScroll}>
+            <div ref={flowRef} className="chat-transcript h-full overflow-y-auto" onScroll={handleFlowScroll}>
+              {!timeline.length && <div className="chat-empty"><span>前台</span><h2>有什么想交给公会？</h2><p>从一个想法开始。我们一起把目标、范围和验收方式说清楚。</p></div>}
               {timeline.map((item, index) => {
                 if (item.kind === 'toolGroup') return <ToolGroup key={`tools-${item.tools[0].toolId}`} group={item} />
-                if (item.kind === 'divider') return <div key={`divider-${index}`} className="reply-divider"><span>工具执行后继续回复</span></div>
+                if (item.kind === 'divider') return null
                 if (item.kind === 'action') {
                   return <div key={`action-${index}`} className={`rounded border px-3 py-2 text-xs ${item.status === 'error' ? 'border-red-200 bg-red-50 text-red-700' : item.status === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-blue-200 bg-blue-50 text-blue-700'}`}>{item.text}</div>
                 }
                 return (
                   <div key={`${item.kind}-${index}`} className={`flex ${item.kind === 'user' ? 'justify-end' : 'justify-start'}`}>
                     <div className={`chat-message ${item.kind === 'user' ? (item.system ? 'whitespace-pre-wrap border border-amber-200 bg-amber-50 text-amber-800' : 'user-message whitespace-pre-wrap bg-blue-600 text-white') : 'agent-message text-gray-900'}`}>
-                      {item.kind === 'agent' ? <MarkdownMessage text={item.text} /> : item.system ? <><span className="mr-1 rounded bg-amber-100 px-1 text-[10px] font-medium">系统转达</span>{item.text}</> : item.text}
+                      {item.kind === 'agent' ? <><span className="speaker-label">前台</span><MarkdownMessage text={item.text} /></> : item.system ? <><span className="mr-1 rounded bg-amber-100 px-1 text-[10px] font-medium">系统转达</span>{item.text}</> : item.text}
                     </div>
                   </div>
                 )
@@ -437,13 +477,14 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
               </button>
             )}
           </div>
+          {hasQuestDocument && !showQuest && <button className="document-ready" onClick={toggleQuest}>需求单已就绪 <span>查看与编辑 →</span></button>}
           {drafting && (
             <div className="chat-composer border-t">
               <div className="flex items-end gap-2">
                 <textarea
                   className="max-h-48 flex-1 resize-y rounded border p-2 text-sm"
                   rows={2}
-                  placeholder="回答前台的问题；Agent 工作时也可以直接插话"
+                  aria-label="对话输入" placeholder="补充你的想法，工作中也可以继续发送…"
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={(event) => {
@@ -460,31 +501,25 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project }
           )}
         </div>
 
-        {hasQuestPanel && (
-          <div className="quest-document flex flex-col">
-            {error && <div className="m-3 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</div>}
-            {questDraft != null ? (
-              <div className="flex min-h-0 flex-1 flex-col p-3">
-                <h3 className="mb-2 text-sm font-semibold">需求单（已写入 quest.md，可直接手改）</h3>
-                <textarea className="min-h-0 flex-1 rounded border p-2 font-mono text-xs" value={questDraft} onChange={(event) => setQuestDraft(event.target.value)} />
-                <div className="mt-2 flex gap-2">
-                  <button className="rounded bg-green-600 px-4 py-2 text-sm text-white" disabled={actionBusy} onClick={post}>张贴</button>
-                  <button className="rounded border px-4 py-2 text-sm" onClick={() => setQuestDraft(null)}>收起编辑</button>
-                </div>
-              </div>
-            ) : (
-              <div className="flex min-h-0 flex-1 flex-col p-3">
-                <h3 className="mb-2 text-sm font-semibold">quest.md {state === 'drafting' ? '（已落盘，可编辑后张贴）' : '（已张贴）'}</h3>
-                {state === 'drafting' ? (
-                  <>
-                    <textarea className="min-h-0 flex-1 rounded border p-2 font-mono text-xs" value={detail?.quest_md ?? ''} onChange={(event) => setQuestDraft(event.target.value)} />
-                    <button className="mt-2 rounded bg-green-600 px-4 py-2 text-sm text-white" disabled={actionBusy} onClick={post}>张贴</button>
-                  </>
-                ) : <pre className="min-h-0 flex-1 overflow-auto rounded border bg-gray-50 p-2 font-mono text-xs">{detail?.quest_md}</pre>}
-              </div>
-            )}
-          </div>
-        )}
+        <ReceptionScene filter={sceneFilter} busy={Boolean(agentStatus?.busy)} hidden={hasQuestPanel} />
+        <div role="separator" tabIndex={hasQuestPanel && !focusQuest ? 0 : -1} aria-label="调整对话与需求单宽度" aria-orientation="vertical" aria-valuemin={35} aria-valuemax={65} aria-valuenow={split} className="document-resizer" hidden={!hasQuestPanel || focusQuest}
+          onKeyDown={event => {
+            if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+              event.preventDefault(); rememberReading()
+              setSplit(v => event.key === 'Home' ? 35 : event.key === 'End' ? 65 : Math.max(35, Math.min(65, v + (event.key === 'ArrowLeft' ? -2 : 2))))
+            }
+          }}
+          onPointerDown={event => { rememberReading(); event.currentTarget.setPointerCapture(event.pointerId) }}
+          onPointerMove={event => {
+            if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
+            const rect = columnsRef.current?.getBoundingClientRect()
+            if (rect) { rememberReading(); setSplit(Math.max(35, Math.min(65, (event.clientX - rect.left) / rect.width * 100))) }
+          }}
+          onPointerUp={event => { event.currentTarget.releasePointerCapture(event.pointerId) }}
+        ><span /></div>
+        <QuestDocument text={documentText} visible={hasQuestPanel} editing={editing} dirty={documentDirty} drafting={drafting} busy={actionBusy} focused={focusQuest} error={error}
+          onEdit={() => setEditing(v => !v)} onChange={setQuestDraft} onSave={saveDocument} onPost={post}
+          onFocus={() => { rememberReading(); setFocusQuest(v => !v) }} onClose={toggleQuest} />
       </div>
     </div>
   )
