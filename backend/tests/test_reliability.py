@@ -178,3 +178,104 @@ def test_allowed_test_change_is_warning_not_failure(client, demo_repo, tmp_guild
     client.post(f'/api/quests/{qid}/transition',json={'to':'in_progress'})
     assert _wait_state(client,qid,{'appraised','disputed','failed'})=='appraised'
     assert client.get(f'/api/quests/{qid}/appraisal').json()['touched_tests'] is True
+
+
+@pytest.mark.parametrize('ignored', [False, True])
+def test_delivery_preserves_unrelated_local_data(make_quest, demo_repo, ignored):
+    q, wt = prepare_delivery(make_quest, demo_repo)
+    local = demo_repo / 'local data.jsonl'
+    local.write_bytes(b'\x00local training data\n')
+    if ignored:
+        (demo_repo / '.git/info/exclude').write_text('local data.jsonl\n')
+    assert delivery.preview(q)['ready']
+    commit = delivery.accept(q)
+    assert local.read_bytes() == b'\x00local training data\n'
+    assert gitutil.head_commit(demo_repo) == commit
+    assert delivery.accept(q) == commit
+
+
+@pytest.mark.parametrize('shape', ['same', 'ancestor', 'descendant'])
+@pytest.mark.parametrize('ignored', [False, True])
+def test_delivery_blocks_local_path_collisions(make_quest, demo_repo, shape, ignored):
+    q, wt = prepare_delivery(make_quest, demo_repo)
+    incoming = 'new/file.txt' if shape == 'ancestor' else 'new'
+    local = 'new/file.txt' if shape == 'descendant' else 'new'
+    target = wt / incoming
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('delivered')
+    gitutil._run(['add', '--', incoming], cwd=wt)
+    q.update_state(review_snapshot=gitutil.tracked_snapshot(wt))
+    path = demo_repo / local
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('local')
+    if ignored:
+        (demo_repo / '.git/info/exclude').write_text('new\n')
+    before = gitutil.head_commit(demo_repo)
+    assert delivery.preview(q)['blocking_files'] == [local]
+    with pytest.raises(RuntimeError, match='覆盖'):
+        delivery.accept(q)
+    assert path.read_text() == 'local'
+    assert gitutil.head_commit(demo_repo) == before
+
+
+def test_delivery_rechecks_target_after_commit_creation(make_quest, demo_repo, monkeypatch):
+    q, wt = prepare_delivery(make_quest, demo_repo)
+    original = q.update_state
+    def update(**kwargs):
+        result = original(**kwargs)
+        if 'delivery_commit' in kwargs:
+            (demo_repo / 'src/main.py').write_text('external edit')
+        return result
+    monkeypatch.setattr(q, 'update_state', update)
+    before = gitutil.head_commit(demo_repo)
+    with pytest.raises(RuntimeError, match='已跟踪'):
+        delivery.accept(q)
+    assert gitutil.head_commit(demo_repo) == before
+    assert (demo_repo / 'src/main.py').read_text() == 'external edit'
+
+
+def test_delivery_blocks_staged_change_even_when_worktree_matches_head(make_quest, demo_repo):
+    q, wt = prepare_delivery(make_quest, demo_repo)
+    path = demo_repo / 'src/main.py'
+    original = path.read_bytes()
+    path.write_text('staged')
+    gitutil._run(['add', 'src/main.py'], cwd=demo_repo)
+    path.write_bytes(original)
+    assert delivery.preview(q)['blocking_files'] == ['src/main.py']
+    with pytest.raises(RuntimeError):
+        delivery.accept(q)
+
+
+def test_delivery_refuses_pending_merge_with_clean_files(make_quest, demo_repo):
+    q, wt = prepare_delivery(make_quest, demo_repo)
+    (demo_repo / '.git/MERGE_HEAD').write_text(gitutil.head_commit(demo_repo) + '\n')
+    with pytest.raises(RuntimeError, match='未完成的 Git 操作'):
+        delivery.accept(q)
+
+
+def test_delivery_refuses_concurrent_delivery(make_quest, demo_repo):
+    import fcntl
+    q, wt = prepare_delivery(make_quest, demo_repo)
+    with (demo_repo / '.git/guildhall-delivery.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match='正在交付'):
+            delivery.accept(q)
+
+
+def test_git_preserves_ignored_collision_created_after_last_preview(make_quest, demo_repo, monkeypatch):
+    q, wt = prepare_delivery(make_quest, demo_repo)
+    (wt / 'new').write_text('delivered')
+    gitutil._run(['add', 'new'], cwd=wt)
+    q.update_state(review_snapshot=gitutil.tracked_snapshot(wt))
+    (demo_repo / '.git/info/exclude').write_text('new\n')
+    original = gitutil._run
+    def run(args, **kwargs):
+        if args[0] == 'merge':
+            (demo_repo / 'new').write_text('external local data')
+        return original(args, **kwargs)
+    monkeypatch.setattr(gitutil, '_run', run)
+    before = gitutil.head_commit(demo_repo)
+    with pytest.raises(RuntimeError):
+        delivery.accept(q)
+    assert gitutil.head_commit(demo_repo) == before
+    assert (demo_repo / 'new').read_text() == 'external local data'
