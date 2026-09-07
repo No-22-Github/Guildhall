@@ -7,6 +7,7 @@ export type StationId =
   | 'settings'
 export interface Skin {
   id: string
+  layout?: 'workbench'
   name: string
   description: string
   room: string
@@ -78,6 +79,13 @@ const tavern: Skin = {
   board: { x: 39, y: 16, width: 20, height: 20 },
 }
 export const skins: Skin[] = [
+  {
+    id: 'workbench', layout: 'workbench', name: '工作台',
+    description: '简洁专注的工作区，支持浅色与深色。',
+    room: '', sprites: '', filter: 'none',
+    palette: { accent: '#343936', background: '#f0f1ed' },
+    stations: [], board: { x: 0, y: 0, width: 0, height: 0 },
+  },
   tavern,
   {
     ...tavern,
@@ -89,5 +97,5 @@ export const skins: Skin[] = [
   },
 ]
 export function getSkin(id: string) {
-  return skins.find((s) => s.id === id) ?? tavern
+  return skins.find((s) => s.id === id) ?? skins[0]
 }

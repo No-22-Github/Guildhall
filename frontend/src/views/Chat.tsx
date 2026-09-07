@@ -1,3 +1,5 @@
+import WorkflowSteps from '../components/WorkflowSteps'
+import { WORK_STATE_LABEL } from '../workbenchLabels'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -249,7 +251,7 @@ function MarkdownMessage({ text }: { text: string }) {
   return <div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown></div>
 }
 
-export default function Chat({ questId, onBack, onGotoReview, onDirty, project, sceneFilter }: { sceneFilter?: string; project?: string; onDirty?: (dirty: boolean) => void; questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
+export default function Chat({ questId, onBack, onGotoReview, onDirty, project, sceneFilter, workbench = false, onBusy, taskTitle }: { taskTitle?: string; workbench?: boolean; onBusy?: (busy: boolean) => void; sceneFilter?: string; project?: string; onDirty?: (dirty: boolean) => void; questId: string; onBack: () => void; onGotoReview: (id: string) => void }) {
   const detail = useQuestStatusStream(questId)
   const [input, setInput] = useState('')
   const [showQuest, setShowQuest] = useState(false)
@@ -288,6 +290,8 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project, 
   useEffect(() => { onDirty?.(Boolean(input.trim()) || (questDraft !== null && questDraft !== (savedQuest ?? detail?.quest_md))); return () => onDirty?.(false) }, [input, questDraft, detail?.quest_md, savedQuest, onDirty])
   const [error, setError] = useState('')
   const [actionBusy, setActionBusy] = useState(false)
+  useEffect(() => { onBusy?.(actionBusy); return () => onBusy?.(false) }, [actionBusy, onBusy])
+  const labels = workbench ? WORK_STATE_LABEL : STATE_LABEL
   const [generationRequested, setGenerationRequested] = useState(false)
   const [followingLatest, setFollowingLatest] = useState(true)
   const events = useEventStream(questId, 'receptionist', true)
@@ -343,8 +347,8 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project, 
   const agentStatus = detail?.runtime?.receptionist
 
   useEffect(() => {
-    document.title = `${questId.slice(-12)} · ${state ? STATE_LABEL[state] : ''} · Guildhall`
-  }, [questId, state])
+    document.title = `${questId.slice(-12)} · ${state ? labels[state] : ''} · Guildhall`
+  }, [questId, state, labels])
 
   async function send() {
     const text = input.trim()
@@ -422,9 +426,9 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project, 
   return (
     <div className="chat-workspace flex h-screen flex-col">
       <header className="chat-toolbar flex items-center gap-3 border-b p-3">
-        <button className="text-sm text-blue-600" onClick={onBack}>← 大厅</button>
-        <div className="chat-heading"><strong>前台 · 委托洽谈</strong><span title={project || detail?.state.project}>{project || detail?.state.project}</span></div>
-        {state && <span className="chat-state">{STATE_LABEL[state]}</span>}
+        <button className="text-sm text-blue-600" onClick={onBack}>{workbench ? '← 任务' : '← 大厅'}</button>
+        <div className="chat-heading"><strong>{workbench ? (taskTitle || '需求沟通') : '前台 · 委托洽谈'}</strong><span title={project || detail?.state.project}>{project || detail?.state.project}</span></div>
+        {state && <span className="chat-state">{labels[state]}</span>}
         {detail?.state.error && <span className="flex-1 truncate rounded bg-red-50 px-2 py-1 text-xs text-red-700" title={detail.state.error}>⚠ {detail.state.error}</span>}
         <div className="flex-1" />
         {hasQuestDocument && <button className="rounded border px-3 py-2 text-sm" onClick={toggleQuest}>{showQuest ? '收起需求单 →' : '查看需求单'}</button>}
@@ -443,16 +447,17 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project, 
         )}
       </header>
 
+      {workbench && <WorkflowSteps state={state} />}
       <div ref={columnsRef} style={{ '--chat-split': `${split}%` } as CSSProperties} className={`chat-columns flex min-h-0 flex-1 ${hasQuestPanel ? 'has-quest' : ''} ${hasQuestPanel && focusQuest ? 'document-focused' : ''}`}>
 
         <div className="chat-column flex min-w-0 flex-1 flex-col">
           {!hasQuestPanel && error && (
             <div className="m-3 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-700">{error}</div>
           )}
-          <details className="chat-runtime"><summary><span className={agentStatus?.busy ? 'runtime-dot working' : 'runtime-dot'} />{agentStatus ? ACTIVITY_LABEL[agentStatus.activity] : '会话未连接'}{agentStatus?.active_tool && <span> · {agentStatus.active_tool.title || agentStatus.active_tool.name}</span>}{agentStatus?.busy && agentStatus.seconds_since_event >= 15 && <span> · {Math.round(agentStatus.seconds_since_event)} 秒无新事件</span>}<small>运行详情</small></summary><div><AgentStatusPanel roleName="前台" status={agentStatus} completedTools={completedTools} /></div></details>
+          <details className="chat-runtime"><summary><span className={agentStatus?.busy ? 'runtime-dot working' : 'runtime-dot'} />{agentStatus ? ACTIVITY_LABEL[agentStatus.activity] : '会话未连接'}{agentStatus?.active_tool && <span> · {agentStatus.active_tool.title || agentStatus.active_tool.name}</span>}{agentStatus?.busy && agentStatus.seconds_since_event >= 15 && <span> · {Math.round(agentStatus.seconds_since_event)} 秒无新事件</span>}<small>运行详情</small></summary><div><AgentStatusPanel roleName={workbench ? "需求助手" : "前台"} status={agentStatus} completedTools={completedTools} /></div></details>
           <div className="relative min-h-0 flex-1">
             <div ref={flowRef} className="chat-transcript h-full overflow-y-auto" onScroll={handleFlowScroll}>
-              {!timeline.length && <div className="chat-empty"><span>前台</span><h2>有什么想交给公会？</h2><p>从一个想法开始。我们一起把目标、范围和验收方式说清楚。</p></div>}
+              {!timeline.length && <div className="chat-empty"><span>{workbench ? "需求助手" : "前台"}</span><h2>{workbench ? "这次想完成什么？" : "有什么想交给公会？"}</h2><p>从一个想法开始。我们一起把目标、范围和验收方式说清楚。</p></div>}
               {timeline.map((item, index) => {
                 if (item.kind === 'toolGroup') return <ToolGroup key={`tools-${item.tools[0].toolId}`} group={item} />
                 if (item.kind === 'divider') return null
@@ -462,7 +467,7 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project, 
                 return (
                   <div key={`${item.kind}-${index}`} className={`flex ${item.kind === 'user' ? 'justify-end' : 'justify-start'}`}>
                     <div className={`chat-message ${item.kind === 'user' ? (item.system ? 'whitespace-pre-wrap border border-amber-200 bg-amber-50 text-amber-800' : 'user-message whitespace-pre-wrap bg-blue-600 text-white') : 'agent-message text-gray-900'}`}>
-                      {item.kind === 'agent' ? <><span className="speaker-label">前台</span><MarkdownMessage text={item.text} /></> : item.system ? <><span className="mr-1 rounded bg-amber-100 px-1 text-[10px] font-medium">系统转达</span>{item.text}</> : item.text}
+                      {item.kind === 'agent' ? <><span className="speaker-label">{workbench ? "需求助手" : "前台"}</span><MarkdownMessage text={item.text} /></> : item.system ? <><span className="mr-1 rounded bg-amber-100 px-1 text-[10px] font-medium">系统转达</span>{item.text}</> : item.text}
                     </div>
                   </div>
                 )
@@ -501,7 +506,7 @@ export default function Chat({ questId, onBack, onGotoReview, onDirty, project, 
           )}
         </div>
 
-        <ReceptionScene filter={sceneFilter} busy={Boolean(agentStatus?.busy)} hidden={hasQuestPanel} />
+        {!workbench && <ReceptionScene filter={sceneFilter} busy={Boolean(agentStatus?.busy)} hidden={hasQuestPanel} />}
         <div role="separator" tabIndex={hasQuestPanel && !focusQuest ? 0 : -1} aria-label="调整对话与需求单宽度" aria-orientation="vertical" aria-valuemin={35} aria-valuemax={65} aria-valuenow={split} className="document-resizer" hidden={!hasQuestPanel || focusQuest}
           onKeyDown={event => {
             if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {

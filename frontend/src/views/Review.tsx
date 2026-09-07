@@ -1,3 +1,6 @@
+import WorkflowSteps from '../components/WorkflowSteps'
+import { WORK_STATE_LABEL } from '../workbenchLabels'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '../components/ui/tabs'
 import { useEffect, useMemo, useState } from 'react'
 import { api, STATE_COLOR, STATE_LABEL } from '../api'
 import type { Appraisal, QuestDetail } from '../api'
@@ -6,7 +9,7 @@ import { useQuestStatusStream } from '../useStatusStream'
 import AgentStatusPanel from '../components/AgentStatusPanel'
 
 /** 冒险者/鉴定人的事件流摘要:三段状态面板(§2.3.2) + 最终文本。 */
-function RoleDigest({ questId, role, status }: { questId: string; role: string; status?: QuestDetail['runtime'][string] }) {
+function RoleDigest({ questId, role, status, workbench = false }: { workbench?: boolean; questId: string; role: string; status?: QuestDetail['runtime'][string] }) {
   // failed 页初次挂载时角色可能尚未恢复；connected 翻转后必须重建 SSE，
   // 否则旧连接只重放失败前的几条事件，后续工具/文本永远进不了页面。
   const events = useEventStream(questId, role, true, status?.connected ? 'connected' : 'offline')
@@ -30,7 +33,7 @@ function RoleDigest({ questId, role, status }: { questId: string; role: string; 
     return { tools, text }
   }, [events])
 
-  const roleName = role === 'adventurer' ? '冒险者' : '鉴定人'
+  const roleName = workbench ? (role === 'adventurer' ? '执行助手' : '验收助手') : role === 'adventurer' ? '冒险者' : '鉴定人'
 
   return (
     <div className="rounded border bg-gray-50 p-2 text-xs">
@@ -40,12 +43,14 @@ function RoleDigest({ questId, role, status }: { questId: string; role: string; 
   )
 }
 
-export default function Review({ questId, onBack }: { questId: string; onBack: () => void }) {
+export default function Review({ questId, onBack, workbench = false, onBusy, taskTitle }: { questId: string; onBack: () => void; taskTitle?: string; workbench?: boolean; onBusy?: (busy: boolean) => void }) {
   const detail = useQuestStatusStream(questId)
   const [diff, setDiff] = useState('')
   const [appraisal, setAppraisal] = useState<Appraisal | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  useEffect(() => { onBusy?.(busy); return () => onBusy?.(false) }, [busy, onBusy])
+  const labels = workbench ? WORK_STATE_LABEL : STATE_LABEL
   const [deliveryRevision, setDeliveryRevision] = useState(0)
   const [confirmDelivery, setConfirmDelivery] = useState(false)
   const [delivery, setDelivery] = useState<Awaited<ReturnType<typeof api.delivery>> | null>(null)
@@ -69,8 +74,8 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
   }, [questId, state])
 
   useEffect(() => {
-    document.title = `${questId.slice(-12)} · ${state ? STATE_LABEL[state] : ''} · Guildhall`
-  }, [questId, state])
+    document.title = `${questId.slice(-12)} · ${state ? labels[state] : ''} · Guildhall`
+  }, [questId, state, labels])
   useEffect(() => {
     let active = true
     setDelivery(null)
@@ -128,17 +133,17 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
   }
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="review-workspace flex h-screen flex-col">
       <header className="chat-toolbar flex items-center gap-3 border-b p-3">
         <button className="text-sm text-blue-600" onClick={onBack}>
-          ← 大厅
+          {workbench ? '← 任务' : '← 大厅'}
         </button>
         <div className="chat-heading">
-          <strong>验收台 · 执行与鉴定</strong>
-          <span title={questId}>{questId}</span>
+          <strong>{workbench ? (taskTitle || "执行与审阅") : "验收台 · 执行与鉴定"}</strong>
+          <span title={workbench ? detail?.state.project : questId}>{workbench ? detail?.state.project?.split("/").at(-1) : questId}</span>
         </div>
         {state && (
-          <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATE_COLOR[state]}`}>{STATE_LABEL[state]}</span>
+          <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATE_COLOR[state]}`}>{labels[state]}</span>
         )}
         <div className="flex-1" />
         {state === 'posted' && (
@@ -208,6 +213,8 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
         )}
       </header>
 
+      {workbench && <WorkflowSteps state={state} />}
+
       {confirmDelivery && canAccept && delivery?.ready && <div className="border-b bg-amber-50 p-3 text-sm">
         {state === 'disputed' && <span>本单有争议，请确认已阅读全部验收证据。 </span>}
         <button disabled={busy} className="rounded bg-green-700 px-3 py-2 text-white disabled:opacity-50" onClick={() => { setConfirmDelivery(false); void decide('settled') }}>确认合并至 {delivery.target_branch}</button>
@@ -227,39 +234,45 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
 
       {detail?.state.error && (
         <div className="border-b bg-red-50 p-3 text-sm text-red-800">
-          <span className="font-semibold">⚠ 出入了:</span>
+          <span className="font-semibold">{workbench ? '⚠ 任务异常：' : '⚠ 出入了:'}</span>
           <span className="whitespace-pre-wrap">{detail.state.error}</span>
         </div>
       )}
 
       {(state === 'in_progress' || state === 'appraising' || state === 'failed') && (
         <div className="grid grid-cols-2 gap-2 border-b bg-gray-50 p-2">
-          <RoleDigest questId={questId} role="adventurer" status={detail?.runtime?.adventurer} />
-          <RoleDigest questId={questId} role="appraiser" status={detail?.runtime?.appraiser} />
+          <RoleDigest workbench={workbench} questId={questId} role="adventurer" status={detail?.runtime?.adventurer} />
+          <RoleDigest workbench={workbench} questId={questId} role="appraiser" status={detail?.runtime?.appraiser} />
         </div>
       )}
 
-      <div className="grid min-h-0 flex-1 grid-cols-3 divide-x">
+      <Tabs defaultValue="evidence" className={workbench ? 'workbench-review-tabs' : 'legacy-review-tabs'}>
+        {workbench && <TabsList variant="line" aria-label="审阅内容">
+          <TabsTrigger value="evidence">验收结果</TabsTrigger>
+          <TabsTrigger value="diff">代码改动</TabsTrigger>
+          <TabsTrigger value="document">需求单</TabsTrigger>
+        </TabsList>}
+        <div className="review-panes grid min-h-0 flex-1 grid-cols-3 divide-x">
         {/* 委托书 */}
-        <div className="flex min-h-0 flex-col overflow-hidden p-3">
+        <TabsContent value="document" forceMount className="review-pane flex min-h-0 flex-col overflow-hidden p-3">
           <h3 className="mb-2 text-sm font-semibold">委托书</h3>
           <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap rounded border bg-gray-50 p-2 font-mono text-xs">
             {detail?.quest_md ?? '(还没有委托书)'}
           </pre>
-        </div>
+        </TabsContent>
 
         {/* diff */}
-        <div className="flex min-h-0 flex-col overflow-hidden p-3">
+        <TabsContent value="diff" forceMount className="review-pane flex min-h-0 flex-col overflow-hidden p-3">
           <h3 className="mb-2 text-sm font-semibold">
             git diff {detail?.state.base_commit ? <span className="font-mono text-xs text-gray-400">基点 {detail.state.base_commit.slice(0, 10)}</span> : ''}
           </h3>
           <pre className="min-h-0 flex-1 overflow-auto rounded border bg-gray-50 p-2 font-mono text-xs">
             {diff || '(还没有改动)'}
           </pre>
-        </div>
+        </TabsContent>
 
         {/* 验收结果 */}
-        <div className="flex min-h-0 flex-col overflow-y-auto p-3">
+        <TabsContent value="evidence" forceMount className="review-pane flex min-h-0 flex-col overflow-y-auto p-3">
           <h3 className="mb-2 text-sm font-semibold">验收结果</h3>
           {invalidated && (
             <div className="mb-2 rounded border-2 border-red-500 bg-red-100 p-3 text-sm font-semibold text-red-800">
@@ -305,7 +318,7 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
                 </div>
               )}
               <div className="mt-3 rounded border bg-white p-2">
-                <div className="text-xs font-semibold text-gray-700">summary(有出入必须写在这里,不许省略)</div>
+                <div className="text-xs font-semibold text-gray-700">{workbench ? "验收总结" : "summary(有出入必须写在这里,不许省略)"}</div>
                 <p className="mt-1 whitespace-pre-wrap text-xs text-gray-800">{appraisal.summary}</p>
               </div>
             </>
@@ -314,8 +327,9 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
               {state === 'appraising' ? '鉴定人正在逐条走验收步骤…' : '还没有验收结论'}
             </p>
           )}
+        </TabsContent>
         </div>
-      </div>
+      </Tabs>
     </div>
   )
 }

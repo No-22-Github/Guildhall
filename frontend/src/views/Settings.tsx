@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import { settingsApi, type RoleId, type SettingsSnapshot } from '../api'
 import { skins } from '../skins'
+import ColorModePicker from '../components/ColorModePicker'
+import type { ColorMode } from '../useColorMode'
 const roles: { id: RoleId; name: string; description: string }[] = [
   {
     id: 'receptionist',
@@ -15,6 +17,8 @@ type Draft = Record<
   { model: string; base_url: string; auth_token: string; clear_token: boolean }
 >
 export default function Settings({
+  colorMode,
+  onColorMode,
   skinId,
   onSkin,
   reducedMotion,
@@ -22,6 +26,8 @@ export default function Settings({
   onDirty,
   onBusy,
 }: {
+  colorMode: ColorMode
+  onColorMode: (mode: ColorMode) => void
   skinId: string
   onSkin: (id: string) => void
   reducedMotion: boolean
@@ -108,11 +114,11 @@ export default function Settings({
     <div className="settings-page">
       <div className="section-heading">
         <span className="eyebrow">GUILD PREFERENCES</span>
-        <h2>公会设置</h2>
-        <p>为每位成员选择合适的模型，也让大厅更合你的心意。</p>
+        <h2>{skinId === 'workbench' ? '设置' : '公会设置'}</h2>
+        <p>选择工作区外观，配置各角色使用的模型与 API。</p>
       </div>
       <section>
-        <h3>大厅外观</h3>
+        <h3>界面主题</h3>
         <div className="skin-options">
           {skins.map((s) => (
             <button
@@ -121,7 +127,7 @@ export default function Settings({
               onClick={() => onSkin(s.id)}
               aria-pressed={skinId === s.id}
             >
-              <img src={s.room} style={{ filter: s.filter }} alt="" />
+              {s.layout === 'workbench' ? <div className="workbench-skin-preview" aria-hidden="true"><i /><div><b /><span /><span /><span /><em /></div></div> : <img src={s.room} style={{ filter: s.filter }} alt="" />}
               <strong>
                 {s.name}
                 {skinId === s.id && ' · 当前'}
@@ -130,6 +136,7 @@ export default function Settings({
             </button>
           ))}
         </div>
+        {skinId === 'workbench' && <div className="settings-color-mode"><div><h4>显示模式</h4><p className="muted">柔和浅色或低亮度深色，也可跟随系统自动切换。</p></div><ColorModePicker value={colorMode} onChange={onColorMode} /></div>}
         <label className="check-label">
           <input
             type="checkbox"
@@ -210,7 +217,7 @@ export default function Settings({
               {roles.map(({ id, name, description }) => (
                 <div className="role-settings" key={id}>
                   <div>
-                    <h4>{name}</h4>
+                    <h4>{skinId === 'workbench' ? ({ receptionist: '需求助手', adventurer: '执行助手', appraiser: '验收助手' })[id] : name}</h4>
                     <p>{description}</p>
                   </div>
                   <div className="role-fields">
