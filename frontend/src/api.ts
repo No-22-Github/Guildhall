@@ -129,7 +129,7 @@ export const api = {
       body: JSON.stringify({ to }),
     }),
   getDiff: (id: string) => req<{ diff: string; base_commit: string | null }>(`/api/quests/${id}/diff`),
-  delivery: (id: string) => req<{target_branch: string; ready: boolean; reason: string | null; files: string[]}>(`/api/quests/${id}/delivery`),
+  delivery: (id: string) => req<{target_branch: string; ready: boolean; reason: string | null; blocking_files: string[]; files: string[]}>(`/api/quests/${id}/delivery`),
   reappraise: (id: string) => req<{ok: boolean}>(`/api/quests/${id}/reappraise`, {method: 'POST'}),
   getAppraisal: (id: string) => req<Appraisal>(`/api/quests/${id}/appraisal`),
 }

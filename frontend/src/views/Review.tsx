@@ -46,6 +46,7 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
   const [appraisal, setAppraisal] = useState<Appraisal | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [deliveryRevision, setDeliveryRevision] = useState(0)
   const [confirmDelivery, setConfirmDelivery] = useState(false)
   const [delivery, setDelivery] = useState<Awaited<ReturnType<typeof api.delivery>> | null>(null)
 
@@ -71,10 +72,21 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
     document.title = `${questId.slice(-12)} · ${state ? STATE_LABEL[state] : ''} · Guildhall`
   }, [questId, state])
   useEffect(() => {
+    let active = true
+    setDelivery(null)
+    setConfirmDelivery(false)
     if (state && ['appraised', 'disputed'].includes(state)) {
-      api.delivery(questId).then(setDelivery).catch((e) => setError(String(e)))
+      api.delivery(questId).then((result) => {
+        if (active) setDelivery(result)
+      }).catch((e) => { if (active) setError(String(e)) })
     }
-  }, [questId, state])
+    return () => { active = false }
+  }, [questId, state, deliveryRevision])
+  useEffect(() => {
+    const refresh = () => setDeliveryRevision((n) => n + 1)
+    window.addEventListener('focus', refresh)
+    return () => window.removeEventListener('focus', refresh)
+  }, [])
   const canAccept = state === 'appraised' || state === 'disputed'
   const canAbandon = state === 'disputed'
 
@@ -87,6 +99,7 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
       setError(String(e))
     } finally {
       setBusy(false)
+      setDeliveryRevision((n) => n + 1)
     }
   }
 
@@ -200,7 +213,15 @@ export default function Review({ questId, onBack }: { questId: string; onBack: (
         <button disabled={busy} className="rounded bg-green-700 px-3 py-2 text-white disabled:opacity-50" onClick={() => { setConfirmDelivery(false); void decide('settled') }}>确认合并至 {delivery.target_branch}</button>
         <button className="ml-3" onClick={() => setConfirmDelivery(false)}>取消</button>
       </div>}
-      {delivery && canAccept && <div className="border-b bg-blue-50 p-3 text-sm">交付目标：{delivery.target_branch} · {delivery.files.length} 个文件{delivery.reason && <span className="ml-2 text-red-700">{delivery.reason}</span>}</div>}
+      {canAccept && <div className="border-b bg-blue-50 p-3 text-sm">
+        {delivery ? <>交付目标：{delivery.target_branch} · {delivery.files.length} 个文件
+          {delivery.reason && <span className="ml-2 text-red-700">{delivery.reason}</span>}
+          {!!delivery.blocking_files?.length && <ul className="mt-2 list-inside list-disc break-all font-mono text-red-700">
+            {delivery.blocking_files.map((path) => <li key={path}>{path}</li>)}
+          </ul>}
+        </> : <span>正在检查交付条件</span>}
+        <button disabled={busy} className="ml-3 underline" onClick={() => setDeliveryRevision((n) => n + 1)}>重新检查</button>
+      </div>}
       {detail?.state.delivery_commit && <div className="border-b p-3 text-sm">交付提交：{detail.state.delivery_commit}</div>}
       {error && <div className="rounded border border-red-300 bg-red-50 p-2 text-sm text-red-700">{error}</div>}
 
